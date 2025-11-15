@@ -12,7 +12,10 @@
 #include <algorithm>
 #include <limits>
 #include <random>
+#include <unordered_map>
 #include <fftw3.h>
+#include <mlpack/core.hpp>
+#include <mlpack/methods/dbscan/dbscan.hpp>
 #include "event_reader.hpp"
 
 
@@ -40,6 +43,8 @@ struct FrameState {
   atomic<bool> running{true};
   atomic<u64> events_total{0};
   atomic<u64> events_since_clear{0};
+  double cluster_eps{6.5};
+  size_t cluster_min_points{12};
 } fs;
 
 // OpenCV mouse callback: update cursor coordinates (in window coords)
@@ -78,6 +83,9 @@ inline void event_pixel_callback(const Event &e) {
 void run_dat_reader(const string &dat_path) {
   DatHeaderInfo header;
   bool ok = stream_dat_events(dat_path, event_pixel_callback, &header);
+  if (!ok) {
+    std::cerr << "[reader] failed to stream events from " << dat_path << std::endl;
+  }
   fs.running.store(false);
 }
 
@@ -191,6 +199,9 @@ bool render_frame(FrameState &fs) {
   struct SamplePoint { int x; int y; };
   std::vector<SamplePoint> sample_points;
   std::vector<FrameState::FrameEvent> frame_events_copy; // snapshot for RPM calc outside the lock
+  std::vector<cv::Rect> cluster_boxes;
+  std::vector<double> cluster_coords;
+  cluster_coords.reserve(4096);
 
   {
     lock_guard<mutex> lk(fs.mtx);
@@ -214,6 +225,8 @@ bool render_frame(FrameState &fs) {
       const uchar *row = mask.ptr<uchar>(y);
       for (int x = 0; x < mask.cols; ++x) {
         if (row[x]) {
+          cluster_coords.push_back(static_cast<double>(x));
+          cluster_coords.push_back(static_cast<double>(y));
           ++seen;
           if ((int)sample_points.size() < K) {
             sample_points.push_back({x, y});
@@ -225,6 +238,56 @@ bool render_frame(FrameState &fs) {
             if (r < K) sample_points[(size_t)r] = {x, y};
           }
         }
+      }
+    }
+
+    if (!cluster_coords.empty()) {
+      const size_t point_count = cluster_coords.size() / 2;
+      if (point_count >= fs.cluster_min_points) {
+        arma::mat data(cluster_coords.data(), 2, point_count, /*copy_aux_mem*/ false, /*strict*/ true);
+        mlpack::DBSCAN<> clusterer(fs.cluster_eps, fs.cluster_min_points);
+        arma::Row<size_t> assignments;
+        clusterer.Cluster(data, assignments);
+
+        struct Bounds {
+          int min_x = std::numeric_limits<int>::max();
+          int min_y = std::numeric_limits<int>::max();
+          int max_x = std::numeric_limits<int>::min();
+          int max_y = std::numeric_limits<int>::min();
+          bool initialized = false;
+        };
+
+        std::unordered_map<size_t, Bounds> boxes;
+        boxes.reserve(point_count);
+
+        for (size_t idx = 0; idx < point_count; ++idx) {
+          const size_t label = assignments[idx];
+          if (label == std::numeric_limits<size_t>::max()) continue; // noise
+
+          const int px = static_cast<int>(cluster_coords[2 * idx]);
+          const int py = static_cast<int>(cluster_coords[2 * idx + 1]);
+          auto &b = boxes[label];
+          if (!b.initialized) {
+            b.min_x = b.max_x = px;
+            b.min_y = b.max_y = py;
+            b.initialized = true;
+          } else {
+            b.min_x = std::min(b.min_x, px);
+            b.min_y = std::min(b.min_y, py);
+            b.max_x = std::max(b.max_x, px);
+            b.max_y = std::max(b.max_y, py);
+          }
+        }
+
+        std::vector<cv::Rect> boxes_local;
+        boxes_local.reserve(boxes.size());
+        for (const auto &entry : boxes) {
+          const auto &b = entry.second;
+          if (!b.initialized) continue;
+          boxes_local.emplace_back(cv::Point(b.min_x, b.min_y),
+                                   cv::Point(b.max_x + 1, b.max_y + 1));
+        }
+        cluster_boxes = std::move(boxes_local);
       }
     }
 
@@ -270,7 +333,6 @@ bool render_frame(FrameState &fs) {
   std::vector<double> rpms;
   rpms.reserve(sample_points.size());
   for (const auto &sp : sample_points) {
-    // Collect events in 3x3 around the sample point from the snapshot
     const int x0 = std::max(0, sp.x - 1);
     const int x1 = std::min(display.cols - 1, sp.x + 1);
     const int y0 = std::max(0, sp.y - 1);
@@ -300,6 +362,10 @@ bool render_frame(FrameState &fs) {
       double b = rpms[mid];
       median_rpm = 0.5 * (a + b);
     }
+  }
+
+  for (const auto &rect : cluster_boxes) {
+    cv::rectangle(display, rect, cv::Scalar(0, 0, 255), 2);
   }
 
   // Overlay text

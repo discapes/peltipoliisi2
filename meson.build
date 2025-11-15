@@ -8,7 +8,8 @@ project(
 
 dependencies = [
 	dependency('opencv4'),
-  dependency('fftw3')
+  dependency('fftw3'),
+  dependency('mlpack')
 ]
 
 exe = executable(
