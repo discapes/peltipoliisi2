@@ -11,6 +11,7 @@
 #include <cmath>
 #include <algorithm>
 #include <limits>
+#include <random>
 #include <fftw3.h>
 #include "event_reader.hpp"
 
@@ -186,7 +187,10 @@ double estimate_rpm_from_events(const std::vector<FrameState::FrameEvent> &event
 }
 bool render_frame(FrameState &fs) {
   cv::Mat display;
-  std::vector<FrameState::FrameEvent> roi_events;  // NEW: events under cursor for this frame
+  // We will sample up to 100 points that met the threshold and compute RPM per point
+  struct SamplePoint { int x; int y; };
+  std::vector<SamplePoint> sample_points;
+  std::vector<FrameState::FrameEvent> frame_events_copy; // snapshot for RPM calc outside the lock
 
   {
     lock_guard<mutex> lk(fs.mtx);
@@ -200,25 +204,32 @@ bool render_frame(FrameState &fs) {
     cv::compare(fs.counts, fs.threshold, mask, cv::CMP_GE); // mask: 255 where true
     display.setTo(cv::Scalar(255,255,255), mask);
 
-    // Cursor position
-    int cx = fs.cursor_x.load(memory_order_relaxed);
-    int cy = fs.cursor_y.load(memory_order_relaxed);
-    if (cx >= 0 && cy >= 0 && cy < fs.counts.rows && cx < fs.counts.cols) {
-      int cnt = fs.counts.at<int>(cy, cx);
-      cout << "frame cursor=(" << cx << "," << cy << ") events=" << cnt << "\n";
-      cout.flush();
+    // Sample up to 100 points from pixels that reached the threshold using reservoir sampling
+    const int K = 10;
+    std::mt19937 rng(static_cast<uint32_t>(fs.frame_index.load(memory_order_relaxed)) ^ 0x9e3779b9u);
+    std::uniform_real_distribution<double> uni01(0.0, 1.0);
 
-      // NEW: collect events in 3x3 around cursor for RPM estimation
-      int x0 = std::max(0, cx - 1);
-      int x1 = std::min(fs.frame.cols - 1, cx + 1);
-      int y0 = std::max(0, cy - 1);
-      int y1 = std::min(fs.frame.rows - 1, cy + 1);
-      for (const auto &fe : fs.frame_events) {
-        if (fe.x >= x0 && fe.x <= x1 && fe.y >= y0 && fe.y <= y1) {
-          roi_events.push_back(fe);
+    long long seen = 0;
+    for (int y = 0; y < mask.rows; ++y) {
+      const uchar *row = mask.ptr<uchar>(y);
+      for (int x = 0; x < mask.cols; ++x) {
+        if (row[x]) {
+          ++seen;
+          if ((int)sample_points.size() < K) {
+            sample_points.push_back({x, y});
+          } else {
+            // Replace an existing sample with probability K/seen
+            // Generate an integer r in [0, seen-1] using floating RNG for simplicity
+            // This is sufficient for uniform reservoir sampling.
+            long long r = static_cast<long long>(std::floor(uni01(rng) * seen));
+            if (r < K) sample_points[(size_t)r] = {x, y};
+          }
         }
       }
     }
+
+    // Take a snapshot of frame_events for use outside the lock (we're about to clear)
+    frame_events_copy = fs.frame_events;
 
     // ---- existing dump-to-file logic (unchanged) ----
     for (const auto &req : fs.dump_requests) {
@@ -255,10 +266,40 @@ bool render_frame(FrameState &fs) {
     fs.events_since_clear.store(0, memory_order_relaxed);
   } // mutex unlocked here
 
-  // ---- NEW: compute RPM from roi_events outside the lock ----
-  double rpm = std::numeric_limits<double>::quiet_NaN();
-  if (!roi_events.empty()) {
-    rpm = estimate_rpm_from_events(roi_events);
+  // ---- Compute RPM for each sampled point (using 3x3 neighborhood) and take median ----
+  std::vector<double> rpms;
+  rpms.reserve(sample_points.size());
+  for (const auto &sp : sample_points) {
+    // Collect events in 3x3 around the sample point from the snapshot
+    const int x0 = std::max(0, sp.x - 1);
+    const int x1 = std::min(display.cols - 1, sp.x + 1);
+    const int y0 = std::max(0, sp.y - 1);
+    const int y1 = std::min(display.rows - 1, sp.y + 1);
+    std::vector<FrameState::FrameEvent> local;
+    local.reserve(64);
+    for (const auto &fe : frame_events_copy) {
+      if (fe.x >= x0 && fe.x <= x1 && fe.y >= y0 && fe.y <= y1) {
+        local.push_back(fe);
+      }
+    }
+    if (local.size() >= 16) {
+      double rpm = estimate_rpm_from_events(local);
+      if (std::isfinite(rpm) && rpm > 0.0) rpms.push_back(rpm);
+    }
+  }
+
+  double median_rpm = std::numeric_limits<double>::quiet_NaN();
+  if (!rpms.empty()) {
+    size_t mid = rpms.size() / 2;
+    std::nth_element(rpms.begin(), rpms.begin() + mid, rpms.end());
+    if (rpms.size() % 2 == 1) {
+      median_rpm = rpms[mid];
+    } else {
+      // Even count: average the two middle values
+      double a = *std::max_element(rpms.begin(), rpms.begin() + mid);
+      double b = rpms[mid];
+      median_rpm = 0.5 * (a + b);
+    }
   }
 
   // Overlay text
@@ -270,12 +311,13 @@ bool render_frame(FrameState &fs) {
               cv::FONT_HERSHEY_SIMPLEX, 0.5,
               cv::Scalar(0,255,0), 1, cv::LINE_AA);
 
-  // NEW: RPM overlay in corner
+  // RPM overlay in corner: show median of sampled points
   string rpm_text;
-  if (roi_events.size() < 16 || std::isnan(rpm) || rpm <= 0.0) {
-    rpm_text = "RPM: N/A";
+  if (!std::isfinite(median_rpm) || median_rpm <= 0.0) {
+    rpm_text = "RPM (median of samples): N/A";
   } else {
-    rpm_text = "RPM: " + to_string(static_cast<int>(std::round(rpm)));
+    rpm_text = "RPM (median of samples): " + to_string(static_cast<int>(std::round(median_rpm))) +
+               "  (n=" + to_string(sample_points.size()) + "/valid=" + to_string(rpms.size()) + ")";
   }
   cv::putText(display, rpm_text, cv::Point(10, 45),
               cv::FONT_HERSHEY_SIMPLEX, 0.6,
