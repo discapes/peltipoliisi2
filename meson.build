@@ -12,7 +12,10 @@ dependencies = [
 
 exe = executable(
   'peltipoliisi2',
-  'peltipoliisi2.cpp',
+  [
+    'peltipoliisi2.cpp',
+    'event_reader.cpp',
+  ],
   install : true,
   dependencies : dependencies,
 )
