@@ -1,4 +1,3 @@
-#include "event_reader.hpp"
 #include <fstream>
 #include <iostream>
 #include <vector>
@@ -6,14 +5,15 @@
 #include <chrono>
 #include <thread>
 #include <deque>
+#include "defs.hpp"
 
 namespace {
 #pragma pack(push,1)
 struct RawRecord { u32 t32; u32 w32; }; // 8-byte raw event
 #pragma pack(pop)
 
-Event decode(const RawRecord &r) {
-    Event e;
+FrameEvent decode(const RawRecord &r) {
+    FrameEvent e;
     e.t = r.t32; // already LE on LE hosts
     u32 w = r.w32;
     u32 x = w & 0x3FFFu;          // bits 13..0
@@ -69,7 +69,7 @@ static bool parse_header(ifstream &ifs, DatHeaderInfo *info) {
 }
 
 bool stream_dat_events(const string &path,
-                       const function<void(const Event &, int)> &callback,
+                       const function<void(const FrameEvent &, int)> &callback,
                        DatHeaderInfo *out_header,
                        u32 window_us) {
     ifstream ifs(path, ios::binary);
@@ -93,7 +93,7 @@ bool stream_dat_events(const string &path,
     // We'll stream one event at a time and interleave expirations.
     // Since events are time-ordered, expirations (t + window) are also time-ordered.
     // Maintain a FIFO deque of active events; the front is the next to expire.
-    std::deque<Event> active;
+    deque<FrameEvent> active;
 
     // Realtime pacing anchors
     chrono::steady_clock::time_point wall_base;
@@ -107,7 +107,7 @@ bool stream_dat_events(const string &path,
 
     // Read the first event (to initialize pacing)
     RawRecord rr;
-    Event next_ev{};
+    FrameEvent next_ev{};
     bool has_next_ev = false;
     ifs.read(reinterpret_cast<char*>(&rr), sizeof(rr));
     if (ifs.gcount() == sizeof(rr)) {
@@ -120,15 +120,15 @@ bool stream_dat_events(const string &path,
 
     while (has_next_ev || !active.empty()) {
         // Determine next arrival and next expiry timestamps
-        u32 next_arrival_ts = has_next_ev ? next_ev.t : std::numeric_limits<u32>::max();
-        u32 next_expiry_ts = !active.empty() ? static_cast<u32>(active.front().t + window_us) : std::numeric_limits<u32>::max();
+        u32 next_arrival_ts = has_next_ev ? next_ev.t : numeric_limits<u32>::max();
+        u32 next_expiry_ts = !active.empty() ? static_cast<u32>(active.front().t + window_us) : numeric_limits<u32>::max();
         bool do_expiry = next_expiry_ts <= next_arrival_ts;
 
         u32 schedule_ts = do_expiry ? next_expiry_ts : next_arrival_ts;
         if (have_base) {
             auto target = to_wall_time(schedule_ts);
             auto now = chrono::steady_clock::now();
-            if (target > now) std::this_thread::sleep_until(target);
+            if (target > now) this_thread::sleep_until(target);
         }
 
         if (do_expiry) {
@@ -136,7 +136,7 @@ bool stream_dat_events(const string &path,
             while (!active.empty()) {
                 u32 exp_ts = static_cast<u32>(active.front().t + window_us);
                 if (exp_ts <= schedule_ts) {
-                    Event ev = active.front();
+                    FrameEvent ev = active.front();
                     active.pop_front();
                     if (callback) callback(ev, -1);
                 } else {

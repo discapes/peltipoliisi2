@@ -20,15 +20,14 @@
 #include <mlpack/core.hpp>
 #include <mlpack/methods/dbscan/dbscan.hpp>
 #include "defs.hpp"
-#include "rpm_estimator.hpp"
 
 void cluster_worker() {
-  std::vector<double> coords;
-  std::vector<FrameState::FrameEvent> events;
+  vector<double> coords;
+  vector<FrameEvent> events;
   while (true) {
     u64 frame_id = 0;
     {
-      std::unique_lock<std::mutex> lk(fs.cluster_request_mtx);
+      unique_lock<mutex> lk(fs.cluster_request_mtx);
       fs.cluster_request_cv.wait(lk, [] {
         return fs.cluster_request_ready || !fs.running.load();
       });
@@ -39,7 +38,7 @@ void cluster_worker() {
       fs.cluster_request_ready = false;
     }
 
-    std::vector<FrameState::ClusterOverlay> overlays;
+    vector<FrameState::ClusterOverlay> overlays;
     const size_t point_count = coords.size() / 2;
     if (point_count >= fs.cluster_min_points) {
       try {
@@ -49,18 +48,18 @@ void cluster_worker() {
         clusterer.Cluster(data, assignments);
 
         struct Bounds {
-          int min_x = std::numeric_limits<int>::max();
-          int min_y = std::numeric_limits<int>::max();
-          int max_x = std::numeric_limits<int>::min();
-          int max_y = std::numeric_limits<int>::min();
+          int min_x = numeric_limits<int>::max();
+          int min_y = numeric_limits<int>::max();
+          int max_x = numeric_limits<int>::min();
+          int max_y = numeric_limits<int>::min();
           bool initialized = false;
         };
-        std::unordered_map<size_t, Bounds> aggregates;
+        unordered_map<size_t, Bounds> aggregates;
         aggregates.reserve(point_count);
 
         for (size_t idx = 0; idx < point_count; ++idx) {
           const size_t label = assignments[idx];
-          if (label == std::numeric_limits<size_t>::max()) continue;
+          if (label == numeric_limits<size_t>::max()) continue;
           Bounds &b = aggregates[label];
           int px = static_cast<int>(coords[2 * idx]);
           int py = static_cast<int>(coords[2 * idx + 1]);
@@ -69,25 +68,25 @@ void cluster_worker() {
             b.min_y = b.max_y = py;
             b.initialized = true;
           } else {
-            b.min_x = std::min(b.min_x, px);
-            b.min_y = std::min(b.min_y, py);
-            b.max_x = std::max(b.max_x, px);
-            b.max_y = std::max(b.max_y, py);
+            b.min_x = min(b.min_x, px);
+            b.min_y = min(b.min_y, py);
+            b.max_x = max(b.max_x, px);
+            b.max_y = max(b.max_y, py);
           }
         }
 
-        std::vector<std::pair<size_t, Bounds>> clusters;
+        vector<pair<size_t, Bounds>> clusters;
         clusters.reserve(aggregates.size());
         for (auto &entry : aggregates) {
           if (!entry.second.initialized) continue;
           clusters.emplace_back(entry.first, entry.second);
         }
-        std::sort(clusters.begin(), clusters.end(),
+        sort(clusters.begin(), clusters.end(),
                   [](const auto &a, const auto &b) {
                     return a.first < b.first;
                   });
 
-        static const std::array<cv::Scalar, 8> palette = {
+        static const array<cv::Scalar, 8> palette = {
             cv::Scalar(0, 0, 255),
             cv::Scalar(0, 255, 0),
             cv::Scalar(255, 0, 0),
@@ -106,7 +105,7 @@ void cluster_worker() {
                                  cv::Point(b.max_x + 1, b.max_y + 1));
           overlay.color = palette[idx % palette.size()];
 
-          std::vector<FrameState::FrameEvent> local;
+          vector<FrameEvent> local;
           local.reserve(128);
           for (const auto &ev : events) {
             if (overlay.box.contains(cv::Point(ev.x, ev.y))) {
@@ -115,18 +114,18 @@ void cluster_worker() {
           }
           if (local.size() >= 16) {
             double rpm = estimate_rpm_from_events(local);
-            if (std::isfinite(rpm) && rpm > 0.0) overlay.rpm = rpm;
+            if (isfinite(rpm) && rpm > 0.0) overlay.rpm = rpm;
           }
-          overlays.push_back(std::move(overlay));
+          overlays.push_back(move(overlay));
         }
-      } catch (const std::exception &ex) {
-        std::cerr << "[cluster-worker] DBSCAN failed: " << ex.what() << std::endl;
+      } catch (const exception &ex) {
+        cerr << "[cluster-worker] DBSCAN failed: " << ex.what() << endl;
       }
     }
 
     {
-      std::lock_guard<std::mutex> lk(fs.overlay_mtx);
-      fs.overlay_data = std::move(overlays);
+      lock_guard<mutex> lk(fs.overlay_mtx);
+      fs.overlay_data = move(overlays);
       fs.overlay_frame = frame_id;
     }
 
