@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include "event_reader.hpp"
 using namespace std;
 
 // Small struct to hold shared square state and window params
@@ -122,5 +123,38 @@ int main(int argc, char **argv) {
   std::cout << "initializing...\n";
   std::cout << "Press ESC or 'q' to quit.\n";
 
-  return run_app();
+  // Kick off DAT reader in a background thread (non-blocking for UI).
+  // Assumption: file path is fixed; change as needed.
+  const std::string dat_path = "data/fan_const_rpm.dat"; // placeholder
+  std::thread dat_reader([dat_path]() {
+    DatHeaderInfo header;
+    std::uint64_t count = 0;
+    std::uint32_t first_ts = 0, last_ts = 0;
+    double wall_sec = 0.0;
+    std::uint64_t span_us = 0;
+    bool ok = stream_dat_events(dat_path,
+                                nullptr, // no per-event processing yet
+                                &header,
+                                &count,
+                                &first_ts,
+                                &last_ts,
+                                &wall_sec,
+                                &span_us,
+                                true); // realtime pacing enabled
+    if (ok) {
+      std::cout << "[DAT] Parsed header: width=" << header.width
+                << " height=" << header.height
+                << " version=" << header.version
+                << " date=" << header.date
+                << " events=" << count << "\n";
+      std::cout << "[DAT] Data timespan: " << span_us << " us (first=" << first_ts
+                << " last=" << last_ts << ") wall_clock=" << wall_sec << " s\n";
+    } else {
+      std::cout << "[DAT] Reader finished with error or file missing (" << dat_path << ").\n";
+    }
+  });
+
+  int res = run_app();
+  if (dat_reader.joinable()) dat_reader.join();
+  return res;
 }
