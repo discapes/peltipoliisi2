@@ -7,8 +7,8 @@ project(
 )
 
 dependencies = [
-	dependency('opencv4')
-  dependency('fftw')
+	dependency('opencv4'),
+  dependency('fftw3')
 ]
 
 exe = executable(
