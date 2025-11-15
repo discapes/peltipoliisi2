@@ -26,7 +26,7 @@ struct FrameState {
   std::atomic<int> cursor_y{-1};
   std::atomic<u64> frame_index{0};
   // Events collected in the current frame (reset each render)
-  struct FrameEvent { u32 t; uint16_t x; uint16_t y; }; // lightweight record
+  struct FrameEvent { u32 t; uint16_t x; uint16_t y; uint8_t pol; }; // lightweight record with polarity
   std::vector<FrameEvent> frame_events;
   // Requests to dump timestamps for a given (x,y) at frame end
   struct DumpRequest { int x; int y; };
@@ -59,7 +59,7 @@ inline void event_pixel_callback(const Event &e) {
   // Prevent overflow in very long runs.
   if (cnt < INT32_MAX) ++cnt;
   // Store timestamp and location for this frame
-  fs.frame_events.push_back(FrameState::FrameEvent{e.t, e.x, e.y});
+  fs.frame_events.push_back(FrameState::FrameEvent{e.t, e.x, e.y, e.polarity});
   fs.events_total.fetch_add(1, memory_order_relaxed);
   fs.events_since_clear.fetch_add(1, memory_order_relaxed);
   auto total = fs.events_total.load(memory_order_relaxed);
@@ -97,22 +97,28 @@ bool render_frame(FrameState &fs) {
     }
     // Process any pending dump requests for this frame: write matching timestamps to files.
     for (const auto &req : fs.dump_requests) {
-      std::vector<u32> timestamps;
+      std::vector<FrameState::FrameEvent> matches;
+      int x0 = std::max(0, req.x - 1);
+      int x1 = std::min(fs.frame.cols - 1, req.x + 1);
+      int y0 = std::max(0, req.y - 1);
+      int y1 = std::min(fs.frame.rows - 1, req.y + 1);
       for (const auto &fe : fs.frame_events) {
-        if (fe.x == static_cast<uint16_t>(req.x) && fe.y == static_cast<uint16_t>(req.y)) timestamps.push_back(fe.t);
+        if (fe.x >= x0 && fe.x <= x1 && fe.y >= y0 && fe.y <= y1) matches.push_back(fe);
       }
-      if (!timestamps.empty()) {
-        std::string fname = "cursor_events_frame" + std::to_string(fs.frame_index.load(memory_order_relaxed)) + "_" + std::to_string(req.x) + "_" + std::to_string(req.y) + ".txt";
+      if (!matches.empty()) {
+        std::string fname = "cursor_events_frame" + std::to_string(fs.frame_index.load(memory_order_relaxed)) + "_" + std::to_string(req.x) + "_" + std::to_string(req.y) + "_3x3.csv";
         std::ofstream ofs(fname);
         if (ofs) {
-          for (u32 t : timestamps) ofs << t << "\n";
+          for (const auto &fe : matches) {
+            ofs << fe.t << ' ' << static_cast<int>(fe.pol) << '\n';
+          }
           ofs.close();
-          std::cout << "[cursor-events] wrote " << timestamps.size() << " timestamps to " << fname << std::endl;
+          std::cout << "[cursor-events] wrote " << matches.size() << " lines (3x3 around " << req.x << "," << req.y << ") to " << fname << std::endl;
         } else {
           std::cerr << "[cursor-events] failed to open file " << fname << std::endl;
         }
       } else {
-        std::cout << "[cursor-events] no events at (" << req.x << "," << req.y << ") this frame" << std::endl;
+        std::cout << "[cursor-events] no events in 3x3 around (" << req.x << "," << req.y << ") this frame" << std::endl;
       }
     }
     // Clear counters so threshold must be reached again next frame
