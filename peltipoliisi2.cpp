@@ -5,6 +5,9 @@
 #include <mutex>
 #include <atomic>
 #include <chrono>
+#include <vector>
+#include <fstream>
+#include <string>
 #include "event_reader.hpp"
 
 
@@ -19,10 +22,33 @@ struct FrameState {
   cv::Mat frame; // BGR display buffer
   cv::Mat counts; // CV_32SC1 per-pixel event counters
   int threshold{10};
+  std::atomic<int> cursor_x{-1};
+  std::atomic<int> cursor_y{-1};
+  std::atomic<u64> frame_index{0};
+  // Events collected in the current frame (reset each render)
+  struct FrameEvent { u32 t; uint16_t x; uint16_t y; }; // lightweight record
+  std::vector<FrameEvent> frame_events;
+  // Requests to dump timestamps for a given (x,y) at frame end
+  struct DumpRequest { int x; int y; };
+  std::vector<DumpRequest> dump_requests;
   atomic<bool> running{true};
   atomic<u64> events_total{0};
   atomic<u64> events_since_clear{0};
 } fs;
+
+// OpenCV mouse callback: update cursor coordinates (in window coords)
+static void on_mouse(int event, int x, int y, int /*flags*/, void* /*userdata*/) {
+  if (event == cv::EVENT_MOUSEMOVE) {
+    fs.cursor_x.store(x, memory_order_relaxed);
+    fs.cursor_y.store(y, memory_order_relaxed);
+  } else if (event == cv::EVENT_LBUTTONDOWN) {
+    // Record cursor and enqueue a dump request; actual file IO will be done at frame end.
+    fs.cursor_x.store(x, memory_order_relaxed);
+    fs.cursor_y.store(y, memory_order_relaxed);
+    std::lock_guard<std::mutex> lk(fs.mtx);
+    fs.dump_requests.push_back(FrameState::DumpRequest{x, y});
+  }
+}
 
 // On each incoming event: increment per-pixel counter and update totals.
 inline void event_pixel_callback(const Event &e) {
@@ -32,6 +58,8 @@ inline void event_pixel_callback(const Event &e) {
   int &cnt = fs.counts.at<int>(e.y, e.x);
   // Prevent overflow in very long runs.
   if (cnt < INT32_MAX) ++cnt;
+  // Store timestamp and location for this frame
+  fs.frame_events.push_back(FrameState::FrameEvent{e.t, e.x, e.y});
   fs.events_total.fetch_add(1, memory_order_relaxed);
   fs.events_since_clear.fetch_add(1, memory_order_relaxed);
   auto total = fs.events_total.load(memory_order_relaxed);
@@ -59,8 +87,40 @@ bool render_frame(FrameState &fs) {
     cv::Mat mask;
     cv::compare(fs.counts, fs.threshold, mask, cv::CMP_GE); // mask: 255 where true
     display.setTo(cv::Scalar(255,255,255), mask);
+    // Before clearing, report count at cursor (if in bounds)
+    int cx = fs.cursor_x.load(memory_order_relaxed);
+    int cy = fs.cursor_y.load(memory_order_relaxed);
+    if (cx >= 0 && cy >= 0 && cy < fs.counts.rows && cx < fs.counts.cols) {
+      int cnt = fs.counts.at<int>(cy, cx);
+      cout << "frame cursor=(" << cx << "," << cy << ") events=" << cnt << "\n";
+      cout.flush();
+    }
+    // Process any pending dump requests for this frame: write matching timestamps to files.
+    for (const auto &req : fs.dump_requests) {
+      std::vector<u32> timestamps;
+      for (const auto &fe : fs.frame_events) {
+        if (fe.x == static_cast<uint16_t>(req.x) && fe.y == static_cast<uint16_t>(req.y)) timestamps.push_back(fe.t);
+      }
+      if (!timestamps.empty()) {
+        std::string fname = "cursor_events_frame" + std::to_string(fs.frame_index.load(memory_order_relaxed)) + "_" + std::to_string(req.x) + "_" + std::to_string(req.y) + ".txt";
+        std::ofstream ofs(fname);
+        if (ofs) {
+          for (u32 t : timestamps) ofs << t << "\n";
+          ofs.close();
+          std::cout << "[cursor-events] wrote " << timestamps.size() << " timestamps to " << fname << std::endl;
+        } else {
+          std::cerr << "[cursor-events] failed to open file " << fname << std::endl;
+        }
+      } else {
+        std::cout << "[cursor-events] no events at (" << req.x << "," << req.y << ") this frame" << std::endl;
+      }
+    }
     // Clear counters so threshold must be reached again next frame
     fs.counts.setTo(0);
+    // Reset per-frame event vector and dump request queue; then advance frame index
+    fs.frame_events.clear();
+    fs.dump_requests.clear();
+    fs.frame_index.fetch_add(1, memory_order_relaxed);
     // Reset per-frame counter (not currently displayed)
     fs.events_since_clear.store(0, memory_order_relaxed);
   }
@@ -99,6 +159,7 @@ int main(int argc, char **argv) {
   fs.frame = cv::Mat(DEFAULT_H, DEFAULT_W, CV_8UC3, cv::Scalar(0,0,0));
   fs.counts = cv::Mat(DEFAULT_H, DEFAULT_W, CV_32SC1, cv::Scalar(0));
   cv::namedWindow("Events", cv::WINDOW_AUTOSIZE);
+  cv::setMouseCallback("Events", on_mouse, nullptr);
 
   thread reader(run_dat_reader, dat_path);
 
