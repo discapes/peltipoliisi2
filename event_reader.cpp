@@ -5,6 +5,7 @@
 #include <cstring>
 #include <chrono>
 #include <thread>
+#include <deque>
 
 namespace {
 #pragma pack(push,1)
@@ -68,8 +69,9 @@ static bool parse_header(ifstream &ifs, DatHeaderInfo *info) {
 }
 
 bool stream_dat_events(const string &path,
-                       const function<void(const Event &)> &callback,
-                       DatHeaderInfo *out_header) {
+                       const function<void(const Event &, int)> &callback,
+                       DatHeaderInfo *out_header,
+                       u32 window_us) {
     ifstream ifs(path, ios::binary);
     if (!ifs) {
         cerr << "Failed to open DAT file: " << path << "\n";
@@ -88,48 +90,80 @@ bool stream_dat_events(const string &path,
 
     if (out_header) *out_header = header;
 
-    constexpr size_t CHUNK_BYTES = 1 << 20; // 1 MB chunk
-    auto wall_start = chrono::steady_clock::now();
-    vector<char> buffer(CHUNK_BYTES);
-    u64 count = 0;
-    bool have_first = false;
-    u32 first_ts = 0;
-    u32 last_ts = 0;
+    // We'll stream one event at a time and interleave expirations.
+    // Since events are time-ordered, expirations (t + window) are also time-ordered.
+    // Maintain a FIFO deque of active events; the front is the next to expire.
+    std::deque<Event> active;
 
-    // For realtime pacing
+    // Realtime pacing anchors
     chrono::steady_clock::time_point wall_base;
+    bool have_base = false;
     u32 ts_base = 0;
 
-    while (ifs) {
-        ifs.read(buffer.data(), buffer.size());
-        streamsize got = ifs.gcount();
-        if (got <= 0) break;
-        // Iterate full RawRecord-sized slices
-        size_t offset = 0;
-        while (offset + sizeof(RawRecord) <= static_cast<size_t>(got)) {
-            RawRecord r;
-            memcpy(&r, buffer.data() + offset, sizeof(RawRecord));
-            offset += sizeof(RawRecord);
-            Event e = decode(r);
-            // Initialize bases on first event (for both stats and realtime pacing)
-            if (callback) callback(e);
-            ++count;
-            if (!have_first) { first_ts = e.t; have_first = true; }
-            last_ts = e.t; // overwrite each time
+    // Helper to convert a DAT timestamp to target wall time using the first event as t0
+    auto to_wall_time = [&](u32 ts){
+        return wall_base + chrono::microseconds(static_cast<int64_t>(ts - ts_base));
+    };
 
-            if (count == 1) {
-                wall_base = chrono::steady_clock::now();
-                ts_base = e.t;
-            } else {
-                u32 delta_us = e.t - ts_base; // microseconds since first event
-                auto target = wall_base + chrono::microseconds(delta_us);
-                auto now = chrono::steady_clock::now();
-                if (target > now) {
-                    this_thread::sleep_until(target);
+    // Read the first event (to initialize pacing)
+    RawRecord rr;
+    Event next_ev{};
+    bool has_next_ev = false;
+    ifs.read(reinterpret_cast<char*>(&rr), sizeof(rr));
+    if (ifs.gcount() == sizeof(rr)) {
+        next_ev = decode(rr);
+        has_next_ev = true;
+        wall_base = chrono::steady_clock::now();
+        have_base = true;
+        ts_base = next_ev.t;
+    }
+
+    while (has_next_ev || !active.empty()) {
+        // Determine next arrival and next expiry timestamps
+        u32 next_arrival_ts = has_next_ev ? next_ev.t : std::numeric_limits<u32>::max();
+        u32 next_expiry_ts = !active.empty() ? static_cast<u32>(active.front().t + window_us) : std::numeric_limits<u32>::max();
+        bool do_expiry = next_expiry_ts <= next_arrival_ts;
+
+        u32 schedule_ts = do_expiry ? next_expiry_ts : next_arrival_ts;
+        if (have_base) {
+            auto target = to_wall_time(schedule_ts);
+            auto now = chrono::steady_clock::now();
+            if (target > now) std::this_thread::sleep_until(target);
+        }
+
+        if (do_expiry) {
+            // Expire all events whose expiry time <= schedule_ts
+            while (!active.empty()) {
+                u32 exp_ts = static_cast<u32>(active.front().t + window_us);
+                if (exp_ts <= schedule_ts) {
+                    Event ev = active.front();
+                    active.pop_front();
+                    if (callback) callback(ev, -1);
+                } else {
+                    break;
                 }
             }
+        } else {
+            // Emit arrival (+1)
+            if (callback) callback(next_ev, +1);
+            // Track active event for future expiry
+            active.push_back(next_ev);
+
+            // Load next event from file
+            ifs.read(reinterpret_cast<char*>(&rr), sizeof(rr));
+            if (ifs.gcount() == sizeof(rr)) {
+                next_ev = decode(rr);
+                has_next_ev = true;
+                // If we somehow didn't have base (shouldn't happen), initialize
+                if (!have_base) {
+                    wall_base = chrono::steady_clock::now();
+                    have_base = true;
+                    ts_base = next_ev.t;
+                }
+            } else {
+                has_next_ev = false;
+            }
         }
-        // Any trailing bytes (< sizeof(RawRecord)) are carried implicitly by overwriting buffer next loop.
     }
 
     return true;

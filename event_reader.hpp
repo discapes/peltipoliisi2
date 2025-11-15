@@ -19,11 +19,13 @@ struct DatHeaderInfo {
     int event_type=-1, event_size=-1;
 };
 
-// Reads a DAT file in the described format. Parses header lines starting with '%'
-// until a line exactly "% end". Then streams binary 8-byte event records without
-// loading the whole file. For each decoded Event, invokes the callback.
-// Returns true on success (file opened and header parsed); false otherwise.
-// The callback may be empty; in that case events are simply discarded.
+// Reads a DAT file and streams events paced to real time.
+// Additionally implements a sliding time window (default 50ms):
+//  - At each event arrival time, invokes callback(e, +1) to indicate an increment.
+//  - When an event leaves the window (t + window_us), invokes callback(e, -1) to indicate a decrement.
+// The function sleeps until the earlier of the next arrival or next expiry to maintain pacing.
+// Returns true on success; false otherwise.
 bool stream_dat_events(const string &path,
-                       const function<void(const Event &)> &callback,
-                       DatHeaderInfo *out_header=nullptr);
+                       const function<void(const Event &, int delta)> &callback,
+                       DatHeaderInfo *out_header=nullptr,
+                       u32 window_us = 50'000);
