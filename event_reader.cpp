@@ -37,10 +37,10 @@ static bool parse_header(std::ifstream &ifs, DatHeaderInfo *info) {
             // Move stream position back to beginning of this line's content for binary.
             auto back = static_cast<std::streamoff>(line.size() + 1); // +1 for newline consumed
             ifs.seekg(-back, std::ios::cur);
-            return true; // header ended implicitly
+            break; // header ended implicitly
         }
         if (line == "% end") {
-            return true; // finished header; binary starts after this line's newline
+            break; // finished header; binary starts after this line's newline
         }
         // Parse key-value pairs of form: % Key value(s)
         if (info) {
@@ -57,7 +57,21 @@ static bool parse_header(std::ifstream &ifs, DatHeaderInfo *info) {
             else if (key == "date") info->date = value;
         }
     }
-    return false; // EOF before end marker
+    // After header: read two bytes (event_type, event_size)
+    char type_byte = 0, size_byte = 0;
+    ifs.read(&type_byte, 1);
+    ifs.read(&size_byte, 1);
+    if (ifs.gcount() < 1) {
+        return false; // missing type byte
+    }
+    if (!ifs) {
+        return false; // missing size byte
+    }
+    if (info) {
+        info->event_type = static_cast<unsigned char>(type_byte);
+        info->event_size = static_cast<unsigned char>(size_byte);
+    }
+    return true;
 }
 
 bool stream_dat_events(const std::string &path,
@@ -77,7 +91,11 @@ bool stream_dat_events(const std::string &path,
 
     DatHeaderInfo header; // local header info
     if (!parse_header(ifs, &header)) {
-        std::cerr << "Failed to parse DAT header or missing % end marker." << "\n";
+        std::cerr << "Failed to parse DAT header or missing type/size bytes." << "\n";
+        return false;
+    }
+    if (header.event_size != 8) {
+        std::cerr << "Unsupported event size " << header.event_size << " (expected 8)." << std::endl;
         return false;
     }
 
