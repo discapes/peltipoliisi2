@@ -32,8 +32,6 @@ using steady = chrono::steady_clock;
 
 FrameState fs;
 
-std::thread cluster_thread;
-
 // On each incoming or expiring event: delta=+1 to increment, delta=-1 to decrement.
 inline void event_pixel_callback(const Event &e, int delta) {
   if (e.x >= fs.frame.cols || e.y >= fs.frame.rows) return;
@@ -292,7 +290,7 @@ int main(int argc, char **argv) {
 
   thread reader(run_dat_reader, dat_path);
   thread rpm_counter(rpm_counter_loop);
-  cluster_thread = std::thread(cluster_worker);
+  thread cluster_thread(cluster_worker);
 
   auto frame_interval = chrono::duration_cast<steady::duration>(chrono::duration<double>(1.0/TARGET_FPS));
   auto next_frame = steady::now();
