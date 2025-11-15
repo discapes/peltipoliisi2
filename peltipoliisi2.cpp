@@ -14,6 +14,7 @@
 #include <random>
 #include <fftw3.h>
 #include "event_reader.hpp"
+#include "rpm_estimator.hpp"
 
 
 
@@ -32,7 +33,7 @@ struct FrameState {
   std::atomic<int> cursor_y{-1};
   std::atomic<u64> frame_index{0};
   // Events collected in the current frame (reset each render)
-  struct FrameEvent { u32 t; uint16_t x; uint16_t y; uint8_t pol; }; // lightweight record with polarity
+  using FrameEvent = Event; // reuse Event from event_reader.hpp
   std::vector<FrameEvent> frame_events;
   // Requests to dump timestamps for a given (x,y) at frame end
   struct DumpRequest { int x; int y; };
@@ -56,135 +57,36 @@ static void on_mouse(int event, int x, int y, int /*flags*/, void* /*userdata*/)
   }
 }
 
-// On each incoming event: increment per-pixel counter and update totals.
-inline void event_pixel_callback(const Event &e) {
+// On each incoming or expiring event: delta=+1 to increment, delta=-1 to decrement.
+inline void event_pixel_callback(const Event &e, int delta) {
   if (e.x >= fs.frame.cols || e.y >= fs.frame.rows) return;
   lock_guard<mutex> lk(fs.mtx);
   // Increment counter; bounds are checked above.
   int &cnt = fs.counts.at<int>(e.y, e.x);
-  // Prevent overflow in very long runs.
-  if (cnt < INT32_MAX) ++cnt;
-  // Store timestamp and location for this frame
-  fs.frame_events.push_back(FrameState::FrameEvent{e.t, e.x, e.y, e.polarity});
-  fs.events_total.fetch_add(1, memory_order_relaxed);
-  fs.events_since_clear.fetch_add(1, memory_order_relaxed);
-  auto total = fs.events_total.load(memory_order_relaxed);
-  if (total % 1000000 == 0) {
-    cout << "[DBG] processed events_total=" << total << endl;
+  if (delta > 0) {
+    if (cnt < INT32_MAX) ++cnt;
+    // Store timestamp and location for this frame (only arrivals)
+    fs.frame_events.push_back(FrameState::FrameEvent{e.t, e.x, e.y, e.polarity});
+    fs.events_total.fetch_add(1, memory_order_relaxed);
+    fs.events_since_clear.fetch_add(1, memory_order_relaxed);
+    auto total = fs.events_total.load(memory_order_relaxed);
+    if (total % 1000000 == 0) {
+      cout << "[DBG] processed events_total=" << total << endl;
+    }
+  } else if (delta < 0) {
+    if (cnt > 0) --cnt; // clamp at 0
   }
 }
 
 // Thread body: stream DAT events, resize frame after header, log summary.
 void run_dat_reader(const string &dat_path) {
   DatHeaderInfo header;
-  bool ok = stream_dat_events(dat_path, event_pixel_callback, &header);
+  // Uses default 50ms window; stream emits +1 on arrival and -1 on expiry.
+  bool ok = stream_dat_events(dat_path, event_pixel_callback, &header, 50'000);
   fs.running.store(false);
 }
 
-// Number of blades on the propeller (adjust if needed)
-static const int NUM_BLADES = 2;
-
-// Estimate RPM from timestamps (µs) of events in a small region using FFTW.
-// Returns NaN if not enough data or no clear peak.
-double estimate_rpm_from_events(const std::vector<FrameState::FrameEvent> &events) {
-  const size_t N = events.size();
-  if (N < 16) return std::numeric_limits<double>::quiet_NaN(); // not enough events
-
-  // Extract times in seconds, sorted
-  std::vector<double> t;
-  t.reserve(N);
-  for (const auto &e : events) t.push_back(static_cast<double>(e.t) * 1e-6);
-  std::sort(t.begin(), t.end());
-
-  const double t0 = t.front();
-  const double t_last = t.back();
-  const double T_total = t_last - t0;
-  if (T_total <= 0.0) return std::numeric_limits<double>::quiet_NaN();
-
-  // Inter-event gaps to estimate a reasonable bin width
-  std::vector<double> dt;
-  dt.reserve(N - 1);
-  for (size_t i = 0; i + 1 < N; ++i) {
-    double d = t[i + 1] - t[i];
-    if (d > 0.0) dt.push_back(d);
-  }
-  if (dt.size() < 4) return std::numeric_limits<double>::quiet_NaN();
-
-  // Median of dt
-  std::nth_element(dt.begin(), dt.begin() + dt.size() / 2, dt.end());
-  double median_dt = dt[dt.size() / 2];
-
-  // Bin width: several times median inter-event gap, but not too small
-  double bin_width = std::max(5.0 * median_dt, 1e-5); // >= 10 µs
-
-  int nbins = static_cast<int>(std::ceil(T_total / bin_width));
-  if (nbins < 16) nbins = 16;
-
-  // Allocate FFTW input/output
-  double *in = (double*)fftw_malloc(sizeof(double) * nbins);
-  fftw_complex *out = (fftw_complex*)fftw_malloc(sizeof(fftw_complex) * (nbins / 2 + 1));
-  if (!in || !out) {
-    if (in) fftw_free(in);
-    if (out) fftw_free(out);
-    return std::numeric_limits<double>::quiet_NaN();
-  }
-
-  // Zero-initialize bins
-  std::fill(in, in + nbins, 0.0);
-
-  // Histogram: event counts per bin
-  for (double ti : t) {
-    double rel = ti - t0;  // relative time
-    int idx = static_cast<int>(rel / bin_width);
-    if (idx >= 0 && idx < nbins) in[idx] += 1.0;
-  }
-
-  // Remove DC (mean) component
-  double sum = 0.0;
-  for (int i = 0; i < nbins; ++i) sum += in[i];
-  double mean = sum / nbins;
-  for (int i = 0; i < nbins; ++i) in[i] -= mean;
-
-  // Plan & execute FFT
-  fftw_plan plan = fftw_plan_dft_r2c_1d(nbins, in, out, FFTW_ESTIMATE);
-  fftw_execute(plan);
-
-  // Frequency axis info
-  double fs = 1.0 / bin_width;          // sampling frequency (Hz)
-  int nfreq = nbins / 2 + 1;
-
-  // Ignore DC (k=0); search within reasonable band
-  double f_min = 5.0;      // Hz
-  double f_max = 5000.0;   // Hz
-
-  double best_mag = 0.0;
-  double best_freq = 0.0;
-
-  for (int k = 1; k < nfreq; ++k) {
-    double f = (static_cast<double>(k) * fs) / nbins;
-    if (f < f_min || f > f_max) continue;
-
-    double re = out[k][0];
-    double im = out[k][1];
-    double mag = std::hypot(re, im);
-
-    if (mag > best_mag) {
-      best_mag = mag;
-      best_freq = f;
-    }
-  }
-
-  fftw_destroy_plan(plan);
-  fftw_free(in);
-  fftw_free(out);
-
-  if (best_freq <= 0.0) return std::numeric_limits<double>::quiet_NaN();
-
-  // best_freq is blade-pass frequency (Hz)
-  double f_rot = best_freq / NUM_BLADES; // rotor frequency
-  double rpm = 60.0 * f_rot;
-  return rpm;
-}
+// RPM estimation moved to rpm_estimator.cpp/rpm_estimator.hpp
 bool render_frame(FrameState &fs) {
   cv::Mat display;
   // We will sample up to 100 points that met the threshold and compute RPM per point
@@ -233,7 +135,7 @@ bool render_frame(FrameState &fs) {
 
     // ---- existing dump-to-file logic (unchanged) ----
     for (const auto &req : fs.dump_requests) {
-      std::vector<FrameState::FrameEvent> matches;
+  std::vector<FrameState::FrameEvent> matches;
       int x0 = std::max(0, req.x - 1);
       int x1 = std::min(fs.frame.cols - 1, req.x + 1);
       int y0 = std::max(0, req.y - 1);
@@ -246,7 +148,7 @@ bool render_frame(FrameState &fs) {
         std::ofstream ofs(fname);
         if (ofs) {
           for (const auto &fe : matches) {
-            ofs << fe.t << ' ' << static_cast<int>(fe.pol) << '\n';
+            ofs << fe.t << ' ' << static_cast<int>(fe.polarity) << '\n';
           }
           ofs.close();
           std::cout << "[cursor-events] wrote " << matches.size() << " lines (3x3 around " << req.x << "," << req.y << ") to " << fname << std::endl;
@@ -258,12 +160,11 @@ bool render_frame(FrameState &fs) {
       }
     }
 
-    // Clear counters and per-frame state for next frame
-    fs.counts.setTo(0);
+  // Clear per-frame state for next frame (do not clear counts; sliding window keeps it updated)
     fs.frame_events.clear();
     fs.dump_requests.clear();
     fs.frame_index.fetch_add(1, memory_order_relaxed);
-    fs.events_since_clear.store(0, memory_order_relaxed);
+  fs.events_since_clear.store(0, memory_order_relaxed);
   } // mutex unlocked here
 
   // ---- Compute RPM for each sampled point (using 3x3 neighborhood) and take median ----
@@ -275,7 +176,7 @@ bool render_frame(FrameState &fs) {
     const int x1 = std::min(display.cols - 1, sp.x + 1);
     const int y0 = std::max(0, sp.y - 1);
     const int y1 = std::min(display.rows - 1, sp.y + 1);
-    std::vector<FrameState::FrameEvent> local;
+  std::vector<FrameState::FrameEvent> local;
     local.reserve(64);
     for (const auto &fe : frame_events_copy) {
       if (fe.x >= x0 && fe.x <= x1 && fe.y >= y0 && fe.y <= y1) {
@@ -283,7 +184,7 @@ bool render_frame(FrameState &fs) {
       }
     }
     if (local.size() >= 16) {
-      double rpm = estimate_rpm_from_events(local);
+  double rpm = estimate_rpm_from_events(local, 2);
       if (std::isfinite(rpm) && rpm > 0.0) rpms.push_back(rpm);
     }
   }

@@ -16,6 +16,7 @@ exe = executable(
   [
     'peltipoliisi2.cpp',
     'event_reader.cpp',
+    'rpm_estimator.cpp',
   ],
   install : true,
   dependencies : dependencies,
