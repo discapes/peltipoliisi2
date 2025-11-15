@@ -8,7 +8,12 @@
 #include <vector>
 #include <fstream>
 #include <string>
+#include <cmath>
+#include <algorithm>
+#include <limits>
+#include <fftw3.h>
 #include "event_reader.hpp"
+
 
 
 const int DEFAULT_W = 1280;
@@ -75,27 +80,147 @@ void run_dat_reader(const string &dat_path) {
   fs.running.store(false);
 }
 
-// Render one frame from counters; overlay text; display; handle controls. Returns false on quit.
+// Number of blades on the propeller (adjust if needed)
+static const int NUM_BLADES = 2;
+
+// Estimate RPM from timestamps (µs) of events in a small region using FFTW.
+// Returns NaN if not enough data or no clear peak.
+double estimate_rpm_from_events(const std::vector<FrameState::FrameEvent> &events) {
+  const size_t N = events.size();
+  if (N < 16) return std::numeric_limits<double>::quiet_NaN(); // not enough events
+
+  // Extract times in seconds, sorted
+  std::vector<double> t;
+  t.reserve(N);
+  for (const auto &e : events) t.push_back(static_cast<double>(e.t) * 1e-6);
+  std::sort(t.begin(), t.end());
+
+  const double t0 = t.front();
+  const double t_last = t.back();
+  const double T_total = t_last - t0;
+  if (T_total <= 0.0) return std::numeric_limits<double>::quiet_NaN();
+
+  // Inter-event gaps to estimate a reasonable bin width
+  std::vector<double> dt;
+  dt.reserve(N - 1);
+  for (size_t i = 0; i + 1 < N; ++i) {
+    double d = t[i + 1] - t[i];
+    if (d > 0.0) dt.push_back(d);
+  }
+  if (dt.size() < 4) return std::numeric_limits<double>::quiet_NaN();
+
+  // Median of dt
+  std::nth_element(dt.begin(), dt.begin() + dt.size() / 2, dt.end());
+  double median_dt = dt[dt.size() / 2];
+
+  // Bin width: several times median inter-event gap, but not too small
+  double bin_width = std::max(5.0 * median_dt, 1e-5); // >= 10 µs
+
+  int nbins = static_cast<int>(std::ceil(T_total / bin_width));
+  if (nbins < 16) nbins = 16;
+
+  // Allocate FFTW input/output
+  double *in = (double*)fftw_malloc(sizeof(double) * nbins);
+  fftw_complex *out = (fftw_complex*)fftw_malloc(sizeof(fftw_complex) * (nbins / 2 + 1));
+  if (!in || !out) {
+    if (in) fftw_free(in);
+    if (out) fftw_free(out);
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+
+  // Zero-initialize bins
+  std::fill(in, in + nbins, 0.0);
+
+  // Histogram: event counts per bin
+  for (double ti : t) {
+    double rel = ti - t0;  // relative time
+    int idx = static_cast<int>(rel / bin_width);
+    if (idx >= 0 && idx < nbins) in[idx] += 1.0;
+  }
+
+  // Remove DC (mean) component
+  double sum = 0.0;
+  for (int i = 0; i < nbins; ++i) sum += in[i];
+  double mean = sum / nbins;
+  for (int i = 0; i < nbins; ++i) in[i] -= mean;
+
+  // Plan & execute FFT
+  fftw_plan plan = fftw_plan_dft_r2c_1d(nbins, in, out, FFTW_ESTIMATE);
+  fftw_execute(plan);
+
+  // Frequency axis info
+  double fs = 1.0 / bin_width;          // sampling frequency (Hz)
+  int nfreq = nbins / 2 + 1;
+
+  // Ignore DC (k=0); search within reasonable band
+  double f_min = 5.0;      // Hz
+  double f_max = 5000.0;   // Hz
+
+  double best_mag = 0.0;
+  double best_freq = 0.0;
+
+  for (int k = 1; k < nfreq; ++k) {
+    double f = (static_cast<double>(k) * fs) / nbins;
+    if (f < f_min || f > f_max) continue;
+
+    double re = out[k][0];
+    double im = out[k][1];
+    double mag = std::hypot(re, im);
+
+    if (mag > best_mag) {
+      best_mag = mag;
+      best_freq = f;
+    }
+  }
+
+  fftw_destroy_plan(plan);
+  fftw_free(in);
+  fftw_free(out);
+
+  if (best_freq <= 0.0) return std::numeric_limits<double>::quiet_NaN();
+
+  // best_freq is blade-pass frequency (Hz)
+  double f_rot = best_freq / NUM_BLADES; // rotor frequency
+  double rpm = 60.0 * f_rot;
+  return rpm;
+}
 bool render_frame(FrameState &fs) {
   cv::Mat display;
+  std::vector<FrameState::FrameEvent> roi_events;  // NEW: events under cursor for this frame
+
   {
     lock_guard<mutex> lk(fs.mtx);
+
     // Prepare display buffer
     display.create(fs.frame.rows, fs.frame.cols, CV_8UC3);
     display.setTo(cv::Scalar(0,0,0));
+
     // Build mask where counts >= threshold and set those pixels to white.
     cv::Mat mask;
     cv::compare(fs.counts, fs.threshold, mask, cv::CMP_GE); // mask: 255 where true
     display.setTo(cv::Scalar(255,255,255), mask);
-    // Before clearing, report count at cursor (if in bounds)
+
+    // Cursor position
     int cx = fs.cursor_x.load(memory_order_relaxed);
     int cy = fs.cursor_y.load(memory_order_relaxed);
     if (cx >= 0 && cy >= 0 && cy < fs.counts.rows && cx < fs.counts.cols) {
       int cnt = fs.counts.at<int>(cy, cx);
       cout << "frame cursor=(" << cx << "," << cy << ") events=" << cnt << "\n";
       cout.flush();
+
+      // NEW: collect events in 3x3 around cursor for RPM estimation
+      int x0 = std::max(0, cx - 1);
+      int x1 = std::min(fs.frame.cols - 1, cx + 1);
+      int y0 = std::max(0, cy - 1);
+      int y1 = std::min(fs.frame.rows - 1, cy + 1);
+      for (const auto &fe : fs.frame_events) {
+        if (fe.x >= x0 && fe.x <= x1 && fe.y >= y0 && fe.y <= y1) {
+          roi_events.push_back(fe);
+        }
+      }
     }
-    // Process any pending dump requests for this frame: write matching timestamps to files.
+
+    // ---- existing dump-to-file logic (unchanged) ----
     for (const auto &req : fs.dump_requests) {
       std::vector<FrameState::FrameEvent> matches;
       int x0 = std::max(0, req.x - 1);
@@ -121,21 +246,46 @@ bool render_frame(FrameState &fs) {
         std::cout << "[cursor-events] no events in 3x3 around (" << req.x << "," << req.y << ") this frame" << std::endl;
       }
     }
-    // Clear counters so threshold must be reached again next frame
+
+    // Clear counters and per-frame state for next frame
     fs.counts.setTo(0);
-    // Reset per-frame event vector and dump request queue; then advance frame index
     fs.frame_events.clear();
     fs.dump_requests.clear();
     fs.frame_index.fetch_add(1, memory_order_relaxed);
-    // Reset per-frame counter (not currently displayed)
     fs.events_since_clear.store(0, memory_order_relaxed);
+  } // mutex unlocked here
+
+  // ---- NEW: compute RPM from roi_events outside the lock ----
+  double rpm = std::numeric_limits<double>::quiet_NaN();
+  if (!roi_events.empty()) {
+    rpm = estimate_rpm_from_events(roi_events);
   }
+
+  // Overlay text
   u64 total = fs.events_total.load(memory_order_relaxed);
-  string text = "events_total=" + to_string(total) + "  threshold=" + to_string(fs.threshold) + "  [c] clear";
-  cv::putText(display, text, cv::Point(10,20), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0,255,0), 1, cv::LINE_AA);
-  if (total == 0) {
-    cv::putText(display, "(no events yet - file reading or pacing)", cv::Point(10,45), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(50,50,200), 1, cv::LINE_AA);
+  string text = "events_total=" + to_string(total) +
+                "  threshold=" + to_string(fs.threshold) +
+                "  [c] clear";
+  cv::putText(display, text, cv::Point(10,20),
+              cv::FONT_HERSHEY_SIMPLEX, 0.5,
+              cv::Scalar(0,255,0), 1, cv::LINE_AA);
+
+  // NEW: RPM overlay in corner
+  string rpm_text;
+  if (roi_events.size() < 16 || std::isnan(rpm) || rpm <= 0.0) {
+    rpm_text = "RPM: N/A";
+  } else {
+    rpm_text = "RPM: " + to_string(static_cast<int>(std::round(rpm)));
   }
+  cv::putText(display, rpm_text, cv::Point(10, 45),
+              cv::FONT_HERSHEY_SIMPLEX, 0.6,
+              cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
+
+  if (total == 0) {
+    cv::putText(display, "(no events yet - file reading or pacing)", cv::Point(10,70),
+                cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(50,50,200), 1, cv::LINE_AA);
+  }
+
   cv::imshow("Events", display);
   int key = cv::waitKey(1);
   if (key == 27 || key == 'q') { fs.running.store(false); return false; }
@@ -145,6 +295,7 @@ bool render_frame(FrameState &fs) {
   }
   return true;
 }
+
 
 int main(int argc, char **argv) {
   // Usage: program <DAT filepath> [threshold]
