@@ -69,13 +69,7 @@ static bool parse_header(ifstream &ifs, DatHeaderInfo *info) {
 
 bool stream_dat_events(const string &path,
                        const function<void(const Event &)> &callback,
-                       DatHeaderInfo *out_header,
-                       u64 *out_event_count,
-                       u32 *out_first_ts,
-                       u32 *out_last_ts,
-                       double *out_wall_seconds,
-                       u64 *out_data_span_us,
-                       bool realtime) {
+                       DatHeaderInfo *out_header) {
     ifstream ifs(path, ios::binary);
     if (!ifs) {
         cerr << "Failed to open DAT file: " << path << "\n";
@@ -123,29 +117,20 @@ bool stream_dat_events(const string &path,
             if (!have_first) { first_ts = e.t; have_first = true; }
             last_ts = e.t; // overwrite each time
 
-            if (realtime) {
-                if (count == 1) {
-                    wall_base = chrono::steady_clock::now();
-                    ts_base = e.t;
-                } else {
-                    u32 delta_us = e.t - ts_base; // microseconds since first event
-                    auto target = wall_base + chrono::microseconds(delta_us);
-                    auto now = chrono::steady_clock::now();
-                    if (target > now) {
-                        this_thread::sleep_until(target);
-                    }
+            if (count == 1) {
+                wall_base = chrono::steady_clock::now();
+                ts_base = e.t;
+            } else {
+                u32 delta_us = e.t - ts_base; // microseconds since first event
+                auto target = wall_base + chrono::microseconds(delta_us);
+                auto now = chrono::steady_clock::now();
+                if (target > now) {
+                    this_thread::sleep_until(target);
                 }
             }
         }
         // Any trailing bytes (< sizeof(RawRecord)) are carried implicitly by overwriting buffer next loop.
     }
-
-    auto wall_end = chrono::steady_clock::now();
-    if (out_event_count) *out_event_count = count;
-    if (out_first_ts) *out_first_ts = have_first ? first_ts : 0u;
-    if (out_last_ts) *out_last_ts = have_first ? last_ts : 0u;
-    if (out_wall_seconds) *out_wall_seconds = chrono::duration<double>(wall_end - wall_start).count();
-    if (out_data_span_us) *out_data_span_us = (have_first && count > 1) ? static_cast<u64>(last_ts - first_ts) : 0ull;
 
     return true;
 }
