@@ -13,30 +13,26 @@
 #include <limits>
 #include <random>
 #include <fftw3.h>
+
+#include <array>
+#include <condition_variable>
+#include <unordered_map>
+#include <mlpack/core.hpp>
+#include <mlpack/methods/dbscan/dbscan.hpp>
 #include "event_reader.hpp"
 #include "rpm_estimator.hpp"
+#include "cluster_worker.hpp"
+#include "defs.hpp"
 
 const int DEFAULT_W = 1280;
 const int DEFAULT_H = 720;
+constexpr int CLUSTER_BOX_PADDING = 6;
 const double TARGET_FPS = 30.0;
 using steady = chrono::steady_clock;
 
-struct FrameState {
-  mutex mtx;
-  cv::Mat frame; // BGR display buffer
-  cv::Mat counts; // CV_32SC1 per-pixel event counters
-  int threshold{10};
-  // Events collected in the current frame (reset each render)
-  using FrameEvent = Event; // reuse Event from event_reader.hpp
-  std::vector<FrameEvent> frame_events;
-  atomic<bool> running{true};
-  struct RpmStats {
-    double median = std::numeric_limits<double>::quiet_NaN();
-    size_t sampled = 0;
-    size_t valid = 0;
-  };
-  RpmStats rpm_stats{};
-} fs;
+FrameState fs;
+
+std::thread cluster_thread;
 
 // On each incoming or expiring event: delta=+1 to increment, delta=-1 to decrement.
 inline void event_pixel_callback(const Event &e, int delta) {
@@ -59,6 +55,7 @@ void run_dat_reader(const string &dat_path) {
   // Uses default 50ms window; stream emits +1 on arrival and -1 on expiry.
   bool ok = stream_dat_events(dat_path, event_pixel_callback, &header, 50'000);
   fs.running.store(false);
+  fs.cluster_request_cv.notify_all();
 }
 
 FrameState::RpmStats compute_rpm_stats_from_counts() {
@@ -69,6 +66,9 @@ FrameState::RpmStats compute_rpm_stats_from_counts() {
   struct SamplePoint { int x; int y; };
   std::vector<SamplePoint> sample_points;
   std::vector<FrameState::FrameEvent> events_snapshot;
+  std::vector<double> cluster_coords;
+  cluster_coords.reserve(4096);
+  u64 frame_id_for_workers = 0;
   int counts_rows = 0, counts_cols = 0, threshold = 0;
 
   {
@@ -89,6 +89,8 @@ FrameState::RpmStats compute_rpm_stats_from_counts() {
       const int *row = fs.counts.ptr<int>(y);
       for (int x = 0; x < counts_cols; ++x) {
         if (row[x] >= threshold) {
+          cluster_coords.push_back(static_cast<double>(x));
+          cluster_coords.push_back(static_cast<double>(y));
           ++seen;
           if (static_cast<int>(sample_points.size()) < K) {
             sample_points.push_back({x, y});
@@ -103,6 +105,7 @@ FrameState::RpmStats compute_rpm_stats_from_counts() {
     events_snapshot = fs.frame_events;
     fs.frame_events.clear();
   }
+  frame_id_for_workers = 0; //fs.frame_index.load(memory_order_relaxed);
 
   stats.sampled = sample_points.size();
   if (sample_points.empty()) return stats;
@@ -140,6 +143,22 @@ FrameState::RpmStats compute_rpm_stats_from_counts() {
       stats.median = 0.5 * (a + b);
     }
   }
+  if (!cluster_coords.empty()) {
+    bool posted_cluster_request = false;
+    {
+      std::lock_guard<std::mutex> req_lk(fs.cluster_request_mtx);
+      if (!fs.cluster_request_ready) {
+        fs.cluster_request_coords = std::move(cluster_coords);
+        fs.cluster_request_events = std::move(events_snapshot);
+        fs.cluster_request_frame = frame_id_for_workers;
+        fs.cluster_request_ready = true;
+        posted_cluster_request = true;
+      }
+    }
+    if (posted_cluster_request) fs.cluster_request_cv.notify_one();
+  }
+
+
   return stats;
 }
 
@@ -179,19 +198,66 @@ bool render_frame() {
   } // mutex unlocked here
 
 
-  // RPM overlay in corner: show median of sampled points
-  string rpm_text;
-  if (!std::isfinite(rpm_stats_copy.median) || rpm_stats_copy.median <= 0.0) {
-    rpm_text = "RPM (median of samples): N/A";
-  } else {
-    rpm_text = "RPM (median of samples): " +
-               to_string(static_cast<int>(std::round(rpm_stats_copy.median))) +
-               "  (n=" + to_string(rpm_stats_copy.sampled) + "/valid=" +
-               to_string(rpm_stats_copy.valid) + ")";
+   std::vector<FrameState::ClusterOverlay> overlays_copy;
+  {
+    std::lock_guard<std::mutex> lk(fs.overlay_mtx);
+    overlays_copy = fs.overlay_data;
   }
-  cv::putText(display, rpm_text, cv::Point(10, 45),
-              cv::FONT_HERSHEY_SIMPLEX, 0.6,
-              cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
+  for (const auto &overlay : overlays_copy) {
+    cv::Rect padded = overlay.box;
+    padded.x = std::max(0, padded.x - CLUSTER_BOX_PADDING);
+    padded.y = std::max(0, padded.y - CLUSTER_BOX_PADDING);
+    padded.width = std::min(display.cols - padded.x,
+                            overlay.box.width + 2 * CLUSTER_BOX_PADDING);
+    padded.height = std::min(display.rows - padded.y,
+                             overlay.box.height + 2 * CLUSTER_BOX_PADDING);
+    cv::rectangle(display, padded, overlay.color, 2);
+  }
+
+  int rpm_block_y = 45;
+  auto put_line = [&](const std::string &line,
+                      const cv::Scalar &text_color = cv::Scalar(0, 255, 255),
+                      const cv::Scalar *marker = nullptr) {
+    if (marker) {
+      cv::rectangle(display,
+                    cv::Point(10, rpm_block_y - 12),
+                    cv::Point(22, rpm_block_y - 2),
+                    *marker, cv::FILLED);
+      cv::putText(display, line, cv::Point(26, rpm_block_y),
+                  cv::FONT_HERSHEY_SIMPLEX, 0.5,
+                  text_color, 1, cv::LINE_AA);
+    } else {
+      cv::putText(display, line, cv::Point(10, rpm_block_y),
+                  cv::FONT_HERSHEY_SIMPLEX, 0.55,
+                  text_color, 1, cv::LINE_AA);
+    }
+    rpm_block_y += 18;
+  };
+
+
+  if (!std::isfinite(rpm_stats_copy.median) || rpm_stats_copy.median <= 0.0) {
+    put_line("Global RPM: N/A");
+  } else {
+    put_line("Global RPM: " + std::to_string(static_cast<int>(std::round(rpm_stats_copy.median))) +
+             " (" + std::to_string(rpm_stats_copy.sampled) + " samples)");
+  }
+
+  if (overlays_copy.empty()) {
+    put_line("Clusters: none");
+  } else {
+    put_line("Clusters:");
+    for (size_t i = 0; i < overlays_copy.size(); ++i) {
+      const auto &overlay = overlays_copy[i];
+      std::string line = "#" + std::to_string(i) + ": ";
+      if (std::isfinite(overlay.rpm)) {
+        line += std::to_string(static_cast<int>(std::round(overlay.rpm))) + " RPM";
+      } else {
+        line += "RPM N/A";
+      }
+      put_line(line, overlay.color, &overlay.color);
+    }
+  }
+
 
   cv::imshow("Events", display);
   int key = cv::waitKey(1);
@@ -226,6 +292,7 @@ int main(int argc, char **argv) {
 
   thread reader(run_dat_reader, dat_path);
   thread rpm_counter(rpm_counter_loop);
+  cluster_thread = std::thread(cluster_worker);
 
   auto frame_interval = chrono::duration_cast<steady::duration>(chrono::duration<double>(1.0/TARGET_FPS));
   auto next_frame = steady::now();
@@ -234,7 +301,11 @@ int main(int argc, char **argv) {
     if (!render_frame()) break;
     this_thread::sleep_until(next_frame);
   }
+
+  fs.running.store(false);
+  fs.cluster_request_cv.notify_all();
   if (reader.joinable()) reader.join();
   if (rpm_counter.joinable()) rpm_counter.join();
+  if (cluster_thread.joinable()) cluster_thread.join();
   return 0;
 }

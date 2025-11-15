@@ -8,7 +8,8 @@ project(
 
 dependencies = [
 	dependency('opencv4'),
-  dependency('fftw3')
+  dependency('fftw3'),
+  dependency('mlpack')
 ]
 
 exe = executable(
@@ -17,6 +18,7 @@ exe = executable(
     'peltipoliisi2.cpp',
     'event_reader.cpp',
     'rpm_estimator.cpp',
+    'cluster_worker.cpp'
   ],
   install : true,
   dependencies : dependencies,
