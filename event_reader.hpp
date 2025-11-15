@@ -3,24 +3,20 @@
 #include <string>
 #include <functional>
 
+using namespace std;
+using u32 = uint32_t;
+using u64 = uint64_t;
+
 // Decoded event structure from 8-byte DAT record.
 // t: timestamp in microseconds
 // x, y: coordinates (14-bit each, stored in lower bits)
 // polarity: 0 or 1
-struct Event {
-    uint32_t t;       // microsecond timestamp
-    uint16_t x;       // 0..16383
-    uint16_t y;       // 0..16383
-    uint8_t polarity; // 0 or 1
-};
+struct Event { u32 t; uint16_t x; uint16_t y; uint8_t polarity; };
 
 struct DatHeaderInfo {
-    int width = -1;
-    int height = -1;
-    int version = -1;
-    std::string date;
-    int event_type = -1;  // new: type byte after header (0 for CD)
-    int event_size = -1;  // new: size byte after header (expected 8)
+    int width=-1, height=-1, version=-1;
+    string date;
+    int event_type=-1, event_size=-1;
 };
 
 // Reads a DAT file in the described format. Parses header lines starting with '%'
@@ -39,12 +35,12 @@ struct DatHeaderInfo {
 //           to take roughly the original capture duration rather than finishing
 //           as fast as possible. When false, events are emitted immediately.
 // NOTE: When realtime is true, wall_clock time reported includes the sleeps.
-bool stream_dat_events(const std::string &path,
-                       const std::function<void(const Event &)> &callback,
-                       DatHeaderInfo *out_header = nullptr,
-                       std::uint64_t *out_event_count = nullptr,
-                       std::uint32_t *out_first_ts = nullptr,
-                       std::uint32_t *out_last_ts = nullptr,
-                       double *out_wall_seconds = nullptr,
-                       std::uint64_t *out_data_span_us = nullptr,
-                       bool realtime = false);
+bool stream_dat_events(const string &path,
+                       const function<void(const Event &)> &callback,
+                       DatHeaderInfo *out_header=nullptr,
+                       u64 *out_event_count=nullptr,
+                       u32 *out_first_ts=nullptr,
+                       u32 *out_last_ts=nullptr,
+                       double *out_wall_seconds=nullptr,
+                       u64 *out_data_span_us=nullptr,
+                       bool realtime=false);
