@@ -1,3 +1,3 @@
 #!/usr/bin/env -S bash -euo pipefail
 
-meson setup build && meson compile -C build && ./build/peltipoliisi2 ./data/drone_moving.dat
+meson setup build && meson compile -C build && ./build/peltipoliisi2 ./data/drone_idle.dat

@@ -25,6 +25,7 @@
 const int DEFAULT_W = 1280;
 const int DEFAULT_H = 720;
 const double TARGET_FPS = 30.0;
+constexpr int CLUSTER_BOX_PADDING = 6;
 using steady = chrono::steady_clock;
 
 
@@ -473,7 +474,14 @@ bool render_frame(FrameState &fs) {
     overlays_copy = fs.overlay_data;
   }
   for (const auto &overlay : overlays_copy) {
-    cv::rectangle(display, overlay.box, overlay.color, 2);
+    cv::Rect padded = overlay.box;
+    padded.x = std::max(0, padded.x - CLUSTER_BOX_PADDING);
+    padded.y = std::max(0, padded.y - CLUSTER_BOX_PADDING);
+    padded.width = std::min(display.cols - padded.x,
+                            overlay.box.width + 2 * CLUSTER_BOX_PADDING);
+    padded.height = std::min(display.rows - padded.y,
+                             overlay.box.height + 2 * CLUSTER_BOX_PADDING);
+    cv::rectangle(display, padded, overlay.color, 2);
   }
 
   // Overlay text
