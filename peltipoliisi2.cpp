@@ -62,49 +62,62 @@ void run_dat_reader(const string &dat_path) {
 }
 
 FrameState::RpmStats compute_rpm_stats_from_counts() {
+  // Thread-safe RPM stats computation. Takes snapshots under lock then
+  // releases the lock for heavier processing. Avoids data races with
+  // event_pixel_callback pushing to frame_events concurrently.
   FrameState::RpmStats stats;
-  if (fs.counts.empty()) return stats;
-
   struct SamplePoint { int x; int y; };
   std::vector<SamplePoint> sample_points;
-  constexpr int K = 100;
-  sample_points.reserve(K);
-  static int frame_seed = 0;
-  std::mt19937 rng(static_cast<uint32_t>(frame_seed++) ^ 0x9e3779b9u);
-  std::uniform_real_distribution<double> uni01(0.0, 1.0);
+  std::vector<FrameState::FrameEvent> events_snapshot;
+  int counts_rows = 0, counts_cols = 0, threshold = 0;
 
-  long long seen = 0;
-  for (int y = 0; y < fs.counts.rows; ++y) {
-    const int *row = fs.counts.ptr<int>(y);
-    for (int x = 0; x < fs.counts.cols; ++x) {
-      if (row[x] >= fs.threshold) {
-        ++seen;
-        if (static_cast<int>(sample_points.size()) < K) {
-          sample_points.push_back({x, y});
-        } else {
-          long long r = static_cast<long long>(std::floor(uni01(rng) * seen));
-          if (r < K) sample_points[static_cast<size_t>(r)] = {x, y};
+  {
+    std::lock_guard<std::mutex> lk(fs.mtx);
+    if (fs.counts.empty()) return stats;
+    counts_rows = fs.counts.rows;
+    counts_cols = fs.counts.cols;
+    threshold = fs.threshold;
+
+    constexpr int K = 10;
+    sample_points.reserve(K);
+    static int frame_seed = 0;
+    std::mt19937 rng(static_cast<uint32_t>(frame_seed++) ^ 0x9e3779b9u);
+    std::uniform_real_distribution<double> uni01(0.0, 1.0);
+
+    long long seen = 0;
+    for (int y = 0; y < counts_rows; ++y) {
+      const int *row = fs.counts.ptr<int>(y);
+      for (int x = 0; x < counts_cols; ++x) {
+        if (row[x] >= threshold) {
+          ++seen;
+          if (static_cast<int>(sample_points.size()) < K) {
+            sample_points.push_back({x, y});
+          } else {
+            long long r = static_cast<long long>(std::floor(uni01(rng) * seen));
+            if (r < K) sample_points[static_cast<size_t>(r)] = {x, y};
+          }
         }
       }
     }
+    // Snapshot events then clear for next interval.
+    events_snapshot = fs.frame_events;
+    fs.frame_events.clear();
   }
 
   stats.sampled = sample_points.size();
-  if (sample_points.empty()) {
-    return stats;
-  }
+  if (sample_points.empty()) return stats;
 
   std::vector<double> rpms;
   rpms.reserve(sample_points.size());
   for (const auto &sp : sample_points) {
     const int x0 = std::max(0, sp.x - 1);
-    const int x1 = std::min(fs.counts.cols - 1, sp.x + 1);
+    const int x1 = std::min(counts_cols - 1, sp.x + 1);
     const int y0 = std::max(0, sp.y - 1);
-    const int y1 = std::min(fs.counts.rows - 1, sp.y + 1);
+    const int y1 = std::min(counts_rows - 1, sp.y + 1);
 
     std::vector<FrameState::FrameEvent> local;
     local.reserve(64);
-    for (const auto &fe : fs.frame_events) {
+    for (const auto &fe : events_snapshot) {
       if (fe.x >= x0 && fe.x <= x1 && fe.y >= y0 && fe.y <= y1) {
         local.push_back(fe);
       }
@@ -114,7 +127,6 @@ FrameState::RpmStats compute_rpm_stats_from_counts() {
       if (std::isfinite(rpm) && rpm > 0.0) rpms.push_back(rpm);
     }
   }
-  fs.frame_events.clear();
 
   stats.valid = rpms.size();
   if (!rpms.empty()) {
@@ -128,7 +140,6 @@ FrameState::RpmStats compute_rpm_stats_from_counts() {
       stats.median = 0.5 * (a + b);
     }
   }
-
   return stats;
 }
 
@@ -137,7 +148,11 @@ void rpm_counter_loop() {
   auto next_frame = steady::now();
   while (fs.running.load()) {
     next_frame += frame_interval;
-    compute_rpm_stats_from_counts();
+    auto stats = compute_rpm_stats_from_counts();
+    {
+      std::lock_guard<std::mutex> lk(fs.mtx);
+      fs.rpm_stats = stats;
+    }
     this_thread::sleep_until(next_frame);
   }
 }
@@ -148,6 +163,7 @@ bool render_frame() {
   cv::Mat counts_snapshot;
   uint64_t frame_seed = 0;
   int threshold = 0;
+  FrameState::RpmStats rpm_stats_copy;
 
   {
     lock_guard<mutex> lk(fs.mtx);
@@ -159,18 +175,19 @@ bool render_frame() {
     cv::Mat mask;
     cv::compare(fs.counts, fs.threshold, mask, cv::CMP_GE); // mask: 255 where true
     display.setTo(cv::Scalar(255,255,255), mask);
+    rpm_stats_copy = fs.rpm_stats; // snapshot under lock
   } // mutex unlocked here
 
 
   // RPM overlay in corner: show median of sampled points
   string rpm_text;
-  if (!std::isfinite(fs.rpm_stats.median) || fs.rpm_stats.median <= 0.0) {
+  if (!std::isfinite(rpm_stats_copy.median) || rpm_stats_copy.median <= 0.0) {
     rpm_text = "RPM (median of samples): N/A";
   } else {
     rpm_text = "RPM (median of samples): " +
-               to_string(static_cast<int>(std::round(fs.rpm_stats.median))) +
-               "  (n=" + to_string(fs.rpm_stats.sampled) + "/valid=" +
-               to_string(fs.rpm_stats.valid) + ")";
+               to_string(static_cast<int>(std::round(rpm_stats_copy.median))) +
+               "  (n=" + to_string(rpm_stats_copy.sampled) + "/valid=" +
+               to_string(rpm_stats_copy.valid) + ")";
   }
   cv::putText(display, rpm_text, cv::Point(10, 45),
               cv::FONT_HERSHEY_SIMPLEX, 0.6,
