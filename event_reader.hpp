@@ -19,6 +19,8 @@ struct DatHeaderInfo {
     int height = -1;
     int version = -1;
     std::string date;
+    int event_type = -1;  // new: type byte after header (0 for CD)
+    int event_size = -1;  // new: size byte after header (expected 8)
 };
 
 // Reads a DAT file in the described format. Parses header lines starting with '%'

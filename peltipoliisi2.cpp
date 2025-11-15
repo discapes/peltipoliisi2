@@ -1,160 +1,100 @@
+// Clean replacement implementation: Event visualizer (30 FPS) coloring pixels by polarity.
 #include <iostream>
 #include <opencv2/opencv.hpp>
 #include <thread>
 #include <mutex>
 #include <atomic>
 #include <chrono>
-#include <cmath>
 #include "event_reader.hpp"
-using namespace std;
 
-// Small struct to hold shared square state and window params
-struct SquareState {
-  int W = 600;
-  int H = 400;
-  int S = 50; // side length
-  double px = 0.0; // top-left x
-  double py = 0.0; // top-left y
-  double vx = 200.0; // px/s
-  double vy = 150.0; // px/s
+struct FrameState {
   std::mutex mtx;
-  std::atomic<bool> running{false};
+  cv::Mat frame; // BGR
+  std::atomic<bool> running{true};
+  std::atomic<uint64_t> events_total{0};
+  std::atomic<uint64_t> events_since_clear{0};
 };
 
-// Initialize the square state to centered position
-void init_state(SquareState &s) {
-  s.px = (s.W - s.S) / 2.0;
-  s.py = (s.H - s.S) / 2.0;
-  s.running.store(true);
-}
+int run_event_visualizer(const std::string &dat_path) {
+  const int DEFAULT_W = 1280;
+  const int DEFAULT_H = 720;
+  FrameState fs;
+  fs.frame = cv::Mat(DEFAULT_H, DEFAULT_W, CV_8UC3, cv::Scalar(0,0,0));
+  cv::namedWindow("Events", cv::WINDOW_AUTOSIZE);
 
-// Simulation thread function: advances physics using real delta time
-void sim_thread_func(SquareState &s) {
-  using clock = std::chrono::steady_clock;
-  auto last = clock::now();
-  while (s.running.load()) {
-    auto now = clock::now();
-    std::chrono::duration<double> elapsed = now - last;
-    last = now;
-    double dt = elapsed.count();
-
-    {
-      std::lock_guard<std::mutex> lk(s.mtx);
-      s.px += s.vx * dt;
-      s.py += s.vy * dt;
-
-      // bounce: keep square fully inside
-      if (s.px <= 0.0) { s.px = 0.0; s.vx = -s.vx; }
-      if (s.px + s.S >= s.W) { s.px = s.W - s.S; s.vx = -s.vx; }
-      if (s.py <= 0.0) { s.py = 0.0; s.vy = -s.vy; }
-      if (s.py + s.S >= s.H) { s.py = s.H - s.S; s.vy = -s.vy; }
-    }
-
-    // small sleep to avoid busy loop
-    std::this_thread::sleep_for(std::chrono::milliseconds(4));
+  bool realtime = true;
+  if (std::getenv("FAST_EVENTS")) {
+    std::cout << "[INFO] FAST_EVENTS set: disabling realtime pacing for rapid fill." << std::endl;
+    realtime = false;
   }
-}
 
-// Render loop runs at target FPS and handles user input; returns when quitting
-int render_loop(SquareState &s, const std::string &window_name = "MyWindow") {
-  // Create window and image buffer
-  cv::Mat img(s.H, s.W, CV_8UC3);
-  cv::namedWindow(window_name, cv::WINDOW_AUTOSIZE);
+  std::thread reader([&fs, dat_path, realtime]() {
+    DatHeaderInfo header; std::uint64_t count=0; std::uint32_t first_ts=0,last_ts=0; double wall_sec=0; std::uint64_t span_us=0;
+    auto cb = [&fs](const Event &e) {
+      if (e.x >= fs.frame.cols || e.y >= fs.frame.rows) return;
+      std::lock_guard<std::mutex> lk(fs.mtx);
+      fs.frame.at<cv::Vec3b>(e.y, e.x) = e.polarity ? cv::Vec3b(0,0,255) : cv::Vec3b(255,0,0);
+      fs.events_total.fetch_add(1, std::memory_order_relaxed);
+      fs.events_since_clear.fetch_add(1, std::memory_order_relaxed);
+      auto total = fs.events_total.load(std::memory_order_relaxed);
+      if (total % 1000000 == 0) {
+        std::cout << "[DBG] processed events_total=" << total << std::endl;
+      }
+    };
+    bool ok = stream_dat_events(dat_path, cb, &header, &count, &first_ts, &last_ts, &wall_sec, &span_us, realtime);
+    if (ok) {
+      // Reallocate frame to actual dimensions if different
+      if ((header.width > 0 && header.height > 0) && (header.width != fs.frame.cols || header.height != fs.frame.rows)) {
+        std::lock_guard<std::mutex> lk(fs.mtx);
+        fs.frame = cv::Mat(header.height, header.width, CV_8UC3, cv::Scalar(0,0,0));
+        std::cout << "[INFO] Resized frame to " << header.width << "x" << header.height << std::endl;
+      }
+      std::cout << "[DAT] header " << header.width << "x" << header.height
+                << " version=" << header.version << " date=" << header.date << "\n"
+                << "[DAT] event_type=" << header.event_type << " event_size=" << header.event_size << "\n"
+                << "[DAT] events=" << count << " span_us=" << span_us << " wall_clock_s=" << wall_sec << "\n";
+    } else {
+      std::cout << "[DAT] failed reading file: " << dat_path << "\n";
+    }
+    fs.running.store(false);
+  });
 
   const double target_fps = 30.0;
   using clock = std::chrono::steady_clock;
-  const clock::duration frame_time = std::chrono::duration_cast<clock::duration>(std::chrono::duration<double>(1.0 / target_fps));
+  auto frame_interval = std::chrono::duration_cast<clock::duration>(std::chrono::duration<double>(1.0/target_fps));
   auto next_frame = clock::now();
-
-  while (s.running.load()) {
-    next_frame += frame_time;
-
-    double rx, ry;
-    int Sloc;
+  while (fs.running.load()) {
+    next_frame += frame_interval;
+    cv::Mat display;
     {
-      std::lock_guard<std::mutex> lk(s.mtx);
-      rx = s.px;
-      ry = s.py;
-      Sloc = s.S;
+      std::lock_guard<std::mutex> lk(fs.mtx);
+      fs.frame.copyTo(display);
+      fs.frame.setTo(cv::Scalar(0,0,0));
+      fs.events_since_clear.store(0, std::memory_order_relaxed);
     }
-
-    // draw
-    img.setTo(cv::Scalar(255, 0, 0));
-    cv::rectangle(img, cv::Point((int)std::round(rx), (int)std::round(ry)),
-                  cv::Point((int)std::round(rx) + Sloc, (int)std::round(ry) + Sloc),
-                  cv::Scalar(0, 255, 0), cv::FILLED);
-
-    cv::imshow(window_name, img);
-
+    // Overlay counters
+    uint64_t total = fs.events_total.load(std::memory_order_relaxed);
+    std::string text = "events_total=" + std::to_string(total);
+    cv::putText(display, text, cv::Point(10,20), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0,255,0), 1, cv::LINE_AA);
+    // If frame is empty (no events this interval) show hint
+    if (total == 0) {
+      cv::putText(display, "(no events yet - file reading or pacing)", cv::Point(10,45), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(50,50,200), 1, cv::LINE_AA);
+    }
+    cv::imshow("Events", display);
     int key = cv::waitKey(1);
-    if (key == 27 || key == 'q') {
-      s.running.store(false);
-      break;
-    }
-
+    if (key == 27 || key == 'q') { fs.running.store(false); }
     std::this_thread::sleep_until(next_frame);
   }
-
+  if (reader.joinable()) reader.join();
   return 0;
 }
 
-// Run the application: init, start sim thread, render, join and cleanup
-int run_app() {
-  SquareState s;
-  init_state(s);
-
-  std::thread sim(sim_thread_func, std::ref(s));
-
-  int res = render_loop(s, "MyWindow");
-
-  // ensure sim stops and join
-  s.running.store(false);
-  if (sim.joinable()) sim.join();
-
-  return res;
-}
-
 int main(int argc, char **argv) {
-  if (argc != 1) {
-    std::cout << argv[0] << " takes no arguments.\n";
+  if (argc > 2) {
+    std::cout << argv[0] << " [optional DAT filepath]\n";
     return 1;
   }
-
-  std::cout << "initializing...\n";
-  std::cout << "Press ESC or 'q' to quit.\n";
-
-  // Kick off DAT reader in a background thread (non-blocking for UI).
-  // Assumption: file path is fixed; change as needed.
-  const std::string dat_path = "data/fan_const_rpm.dat"; // placeholder
-  std::thread dat_reader([dat_path]() {
-    DatHeaderInfo header;
-    std::uint64_t count = 0;
-    std::uint32_t first_ts = 0, last_ts = 0;
-    double wall_sec = 0.0;
-    std::uint64_t span_us = 0;
-    bool ok = stream_dat_events(dat_path,
-                                nullptr, // no per-event processing yet
-                                &header,
-                                &count,
-                                &first_ts,
-                                &last_ts,
-                                &wall_sec,
-                                &span_us,
-                                true); // realtime pacing enabled
-    if (ok) {
-      std::cout << "[DAT] Parsed header: width=" << header.width
-                << " height=" << header.height
-                << " version=" << header.version
-                << " date=" << header.date
-                << " events=" << count << "\n";
-      std::cout << "[DAT] Data timespan: " << span_us << " us (first=" << first_ts
-                << " last=" << last_ts << ") wall_clock=" << wall_sec << " s\n";
-    } else {
-      std::cout << "[DAT] Reader finished with error or file missing (" << dat_path << ").\n";
-    }
-  });
-
-  int res = run_app();
-  if (dat_reader.joinable()) dat_reader.join();
-  return res;
+  std::string path = (argc == 2) ? argv[1] : std::string("data/fan_const_rpm.dat");
+  std::cout << "Event visualizer (30 FPS). File: " << path << "\nESC/q to quit.\n";
+  return run_event_visualizer(path);
 }
