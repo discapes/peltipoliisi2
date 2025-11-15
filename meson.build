@@ -15,10 +15,10 @@ dependencies = [
 exe = executable(
   'peltipoliisi2',
   [
-    'peltipoliisi2.cpp',
-    'event_reader.cpp',
-    'rpm_estimator.cpp',
-    'cluster_worker.cpp'
+    'src/main.cpp',
+    'src/event_reader.cpp',
+    'src/rpm_estimator.cpp',
+    'src/cluster_worker.cpp'
   ],
   install : true,
   dependencies : dependencies,

@@ -19,9 +19,6 @@
 #include <unordered_map>
 #include <mlpack/core.hpp>
 #include <mlpack/methods/dbscan/dbscan.hpp>
-#include "event_reader.hpp"
-#include "rpm_estimator.hpp"
-#include "cluster_worker.hpp"
 #include "defs.hpp"
 
 const int DEFAULT_W = 1280;
@@ -33,7 +30,7 @@ using steady = chrono::steady_clock;
 FrameState fs;
 
 // On each incoming or expiring event: delta=+1 to increment, delta=-1 to decrement.
-inline void event_pixel_callback(const Event &e, int delta) {
+inline void event_pixel_callback(const FrameEvent &e, int delta) {
   if (e.x >= fs.frame.cols || e.y >= fs.frame.rows) return;
   lock_guard<mutex> lk(fs.mtx);
   // Increment counter; bounds are checked above.
@@ -41,7 +38,7 @@ inline void event_pixel_callback(const Event &e, int delta) {
   if (delta > 0) {
     if (cnt < INT32_MAX) ++cnt;
     // Store timestamp and location for this frame (only arrivals)
-    fs.frame_events.push_back(FrameState::FrameEvent{e.t, e.x, e.y, e.polarity});
+    fs.frame_events.push_back(FrameEvent{e.t, e.x, e.y, e.polarity});
   } else if (delta < 0) {
     if (cnt > 0) --cnt; // clamp at 0
   }
@@ -62,15 +59,15 @@ FrameState::RpmStats compute_rpm_stats_from_counts() {
   // event_pixel_callback pushing to frame_events concurrently.
   FrameState::RpmStats stats;
   struct SamplePoint { int x; int y; };
-  std::vector<SamplePoint> sample_points;
-  std::vector<FrameState::FrameEvent> events_snapshot;
-  std::vector<double> cluster_coords;
+  vector<SamplePoint> sample_points;
+  vector<FrameEvent> events_snapshot;
+  vector<double> cluster_coords;
   cluster_coords.reserve(4096);
   u64 frame_id_for_workers = 0;
   int counts_rows = 0, counts_cols = 0, threshold = 0;
 
   {
-    std::lock_guard<std::mutex> lk(fs.mtx);
+    lock_guard<mutex> lk(fs.mtx);
     if (fs.counts.empty()) return stats;
     counts_rows = fs.counts.rows;
     counts_cols = fs.counts.cols;
@@ -79,8 +76,8 @@ FrameState::RpmStats compute_rpm_stats_from_counts() {
     constexpr int K = 10;
     sample_points.reserve(K);
     static int frame_seed = 0;
-    std::mt19937 rng(static_cast<uint32_t>(frame_seed++) ^ 0x9e3779b9u);
-    std::uniform_real_distribution<double> uni01(0.0, 1.0);
+    mt19937 rng(static_cast<u32>(frame_seed++) ^ 0x9e3779b9u);
+    uniform_real_distribution<double> uni01(0.0, 1.0);
 
     long long seen = 0;
     for (int y = 0; y < counts_rows; ++y) {
@@ -93,7 +90,7 @@ FrameState::RpmStats compute_rpm_stats_from_counts() {
           if (static_cast<int>(sample_points.size()) < K) {
             sample_points.push_back({x, y});
           } else {
-            long long r = static_cast<long long>(std::floor(uni01(rng) * seen));
+            long long r = static_cast<long long>(floor(uni01(rng) * seen));
             if (r < K) sample_points[static_cast<size_t>(r)] = {x, y};
           }
         }
@@ -108,15 +105,15 @@ FrameState::RpmStats compute_rpm_stats_from_counts() {
   stats.sampled = sample_points.size();
   if (sample_points.empty()) return stats;
 
-  std::vector<double> rpms;
+  vector<double> rpms;
   rpms.reserve(sample_points.size());
   for (const auto &sp : sample_points) {
-    const int x0 = std::max(0, sp.x - 1);
-    const int x1 = std::min(counts_cols - 1, sp.x + 1);
-    const int y0 = std::max(0, sp.y - 1);
-    const int y1 = std::min(counts_rows - 1, sp.y + 1);
+    const int x0 = max(0, sp.x - 1);
+    const int x1 = min(counts_cols - 1, sp.x + 1);
+    const int y0 = max(0, sp.y - 1);
+    const int y1 = min(counts_rows - 1, sp.y + 1);
 
-    std::vector<FrameState::FrameEvent> local;
+    vector<FrameEvent> local;
     local.reserve(64);
     for (const auto &fe : events_snapshot) {
       if (fe.x >= x0 && fe.x <= x1 && fe.y >= y0 && fe.y <= y1) {
@@ -125,18 +122,18 @@ FrameState::RpmStats compute_rpm_stats_from_counts() {
     }
     if (local.size() >= 16) {
       double rpm = estimate_rpm_from_events(local, 2);
-      if (std::isfinite(rpm) && rpm > 0.0) rpms.push_back(rpm);
+      if (isfinite(rpm) && rpm > 0.0) rpms.push_back(rpm);
     }
   }
 
   stats.valid = rpms.size();
   if (!rpms.empty()) {
     size_t mid = rpms.size() / 2;
-    std::nth_element(rpms.begin(), rpms.begin() + mid, rpms.end());
+    nth_element(rpms.begin(), rpms.begin() + mid, rpms.end());
     if (rpms.size() % 2 == 1) {
       stats.median = rpms[mid];
     } else {
-      double a = *std::max_element(rpms.begin(), rpms.begin() + mid);
+      double a = *max_element(rpms.begin(), rpms.begin() + mid);
       double b = rpms[mid];
       stats.median = 0.5 * (a + b);
     }
@@ -144,10 +141,10 @@ FrameState::RpmStats compute_rpm_stats_from_counts() {
   if (!cluster_coords.empty()) {
     bool posted_cluster_request = false;
     {
-      std::lock_guard<std::mutex> req_lk(fs.cluster_request_mtx);
+      lock_guard<mutex> req_lk(fs.cluster_request_mtx);
       if (!fs.cluster_request_ready) {
-        fs.cluster_request_coords = std::move(cluster_coords);
-        fs.cluster_request_events = std::move(events_snapshot);
+        fs.cluster_request_coords = move(cluster_coords);
+        fs.cluster_request_events = move(events_snapshot);
         fs.cluster_request_frame = frame_id_for_workers;
         fs.cluster_request_ready = true;
         posted_cluster_request = true;
@@ -167,7 +164,7 @@ void rpm_counter_loop() {
     next_frame += frame_interval;
     auto stats = compute_rpm_stats_from_counts();
     {
-      std::lock_guard<std::mutex> lk(fs.mtx);
+      lock_guard<mutex> lk(fs.mtx);
       fs.rpm_stats = stats;
     }
     this_thread::sleep_until(next_frame);
@@ -178,7 +175,7 @@ void rpm_counter_loop() {
 bool render_frame() {
   cv::Mat display;
   cv::Mat counts_snapshot;
-  uint64_t frame_seed = 0;
+  u64 frame_seed = 0;
   int threshold = 0;
   FrameState::RpmStats rpm_stats_copy;
 
@@ -196,24 +193,24 @@ bool render_frame() {
   } // mutex unlocked here
 
 
-   std::vector<FrameState::ClusterOverlay> overlays_copy;
+   vector<FrameState::ClusterOverlay> overlays_copy;
   {
-    std::lock_guard<std::mutex> lk(fs.overlay_mtx);
+    lock_guard<mutex> lk(fs.overlay_mtx);
     overlays_copy = fs.overlay_data;
   }
   for (const auto &overlay : overlays_copy) {
     cv::Rect padded = overlay.box;
-    padded.x = std::max(0, padded.x - CLUSTER_BOX_PADDING);
-    padded.y = std::max(0, padded.y - CLUSTER_BOX_PADDING);
-    padded.width = std::min(display.cols - padded.x,
+    padded.x = max(0, padded.x - CLUSTER_BOX_PADDING);
+    padded.y = max(0, padded.y - CLUSTER_BOX_PADDING);
+    padded.width = min(display.cols - padded.x,
                             overlay.box.width + 2 * CLUSTER_BOX_PADDING);
-    padded.height = std::min(display.rows - padded.y,
+    padded.height = min(display.rows - padded.y,
                              overlay.box.height + 2 * CLUSTER_BOX_PADDING);
     cv::rectangle(display, padded, overlay.color, 2);
   }
 
   int rpm_block_y = 45;
-  auto put_line = [&](const std::string &line,
+  auto put_line = [&](const string &line,
                       const cv::Scalar &text_color = cv::Scalar(0, 255, 255),
                       const cv::Scalar *marker = nullptr) {
     if (marker) {
@@ -233,11 +230,11 @@ bool render_frame() {
   };
 
 
-  if (!std::isfinite(rpm_stats_copy.median) || rpm_stats_copy.median <= 0.0) {
+  if (!isfinite(rpm_stats_copy.median) || rpm_stats_copy.median <= 0.0) {
     put_line("Global RPM: N/A");
   } else {
-    put_line("Global RPM: " + std::to_string(static_cast<int>(std::round(rpm_stats_copy.median))) +
-             " (" + std::to_string(rpm_stats_copy.sampled) + " samples)");
+    put_line("Global RPM: " + to_string(static_cast<int>(round(rpm_stats_copy.median))) +
+             " (" + to_string(rpm_stats_copy.sampled) + " samples)");
   }
 
   if (overlays_copy.empty()) {
@@ -246,9 +243,9 @@ bool render_frame() {
     put_line("Clusters:");
     for (size_t i = 0; i < overlays_copy.size(); ++i) {
       const auto &overlay = overlays_copy[i];
-      std::string line = "#" + std::to_string(i) + ": ";
-      if (std::isfinite(overlay.rpm)) {
-        line += std::to_string(static_cast<int>(std::round(overlay.rpm))) + " RPM";
+      string line = "#" + to_string(i) + ": ";
+      if (isfinite(overlay.rpm)) {
+        line += to_string(static_cast<int>(round(overlay.rpm))) + " RPM";
       } else {
         line += "RPM N/A";
       }
