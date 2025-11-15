@@ -5,14 +5,14 @@ This document explains the structure, threading model, data flow, and design rat
 ## Overview
 The application streams a DAT file containing event camera data and renders a live visualization at a stable 30 FPS. It separates responsibilities across two cooperating threads:
 
-- **Reader Thread**: Decodes events from disk (optionally paced to original capture time) and writes pixels into a shared frame buffer.
-- **Render/Main Thread**: Periodically (30 FPS) copies the frame, overlays statistics, displays the window, and clears the buffer for the next interval.
+- **Reader Thread**: Decodes events from disk (paced to original capture time) and increments per-pixel counters in a shared integer matrix.
+- **Render/Main Thread**: Periodically (30 FPS) composes a display image by coloring pixels white where the counter at that pixel is greater than or equal to a user-selectable threshold, overlays statistics, and shows the window. Counters are reset every frame so previous locations disappear; you can also press `C` to clear mid-frame.
 
 This decoupling keeps UI refresh cadence stable regardless of event burstiness and prevents rendering overhead from throttling event ingestion.
 
 ## Key Source Files
 - `event_reader.hpp` / `event_reader.cpp`: Streaming interface for DAT files (`stream_dat_events`) and event decoding.
-- `peltipoliisi2.cpp`: Application entry point and visualization logic (`run_event_visualizer`, `run_dat_reader`, `render_frame`, `event_pixel_callback`).
+- `peltipoliisi2.cpp`: Application entry point and visualization logic (`run_dat_reader`, `render_frame`, `event_pixel_callback`).
 
 ## Data Structures
 ### `Event`
@@ -23,30 +23,33 @@ Holds parsed header metadata: width, height, version, textual date, event type a
 
 ### `FrameState`
 Shared mutable state between threads:
-- `frame` (`cv::Mat`): Accumulation buffer for the current 1/30 s interval.
+- `frame` (`cv::Mat` 8UC3): Display buffer used by the render thread.
+- `counts` (`cv::Mat` 32SC1): Per-pixel event counters incremented by the reader thread and cleared each frame by the render thread.
+- `threshold` (`int`): Minimum count to color a pixel white in the display.
 - `events_total`: Total events processed since start.
-- `events_since_clear`: Events accumulated in the current frame interval (presently reset but not displayed; available for future stats).
+- `events_since_clear`: Events accumulated since the last render pass (internal stat).
 - `running`: Atomic flag indicating lifecycle termination.
-- `mtx`: Mutex guarding compound operations on `frame` (pixel write, resize, copy+clear).
+- `mtx`: Mutex guarding compound operations on `counts`/`frame`.
 
 ## Thread Responsibilities
 ### Reader Thread (`run_dat_reader`)
 1. Opens the DAT file in binary mode.
 2. Parses the ASCII header lines until `% end`, then consumes two metadata bytes (`event_type`, `event_size`).
 3. Validates event size (must be 8) and streams the file in chunks (1 MB default), decoding each `RawRecord` into an `Event` via bitfield extraction.
-4. Invokes the per-event callback (`event_pixel_callback`) for visualization.
-5. In **realtime mode** (default unless the `FAST_EVENTS` environment variable is set), sleeps to align wall-clock time with event timestamps (using first event timestamp as zero baseline).
+4. Invokes the per-event callback (`event_pixel_callback`) which increments the counter at the event's `(x, y)` location.
+5. Sleeps to align wall-clock time with event timestamps (using first event timestamp as zero baseline).
 6. On completion or error, logs summary stats and sets `running = false` to signal the render loop to stop.
 
-### Render/Main Thread (`run_event_visualizer` loop)
+### Render/Main Thread (main loop)
 1. Initializes a window and an initial frame (default size, later resized if header differs).
 2. Spawns the reader thread.
 3. Enters a deterministic frame loop targeting 30 FPS using `steady_clock` and `sleep_until` to avoid drift.
 4. Each iteration calls `render_frame`:
-   - Copy current accumulation buffer to a local `display` image.
-   - Clear shared `frame` to black, resetting pixel accumulation.
-   - Overlay textual statistics (currently `events_total`).
-   - Show the window and process a single key (ESC or `q` triggers shutdown).
+  - Create a local `display` image.
+  - Compute a mask where `counts >= threshold` and set corresponding pixels to white.
+  - Clear `counts` so the threshold must be reached again in the next frame.
+  - Overlay textual statistics (currently `events_total` and `threshold`).
+  - Show the window and process a single key (ESC or `q` quits, `C` clears counters immediately).
 5. Loop exits when `running` becomes false or the user quits.
 6. Joins the reader thread for orderly shutdown.
 
@@ -57,16 +60,13 @@ Shared mutable state between threads:
 
 ## Timing & Pacing
 - **Rendering cadence**: The main loop calculates the next frame deadline (`next_frame += frame_interval`) and sleeps until that point. Using `sleep_until` instead of `sleep_for` mitigates drift accumulation.
-- **Realtime event pacing**: When enabled, the reader thread derives microsecond deltas from the first event timestamp and sleeps until the corresponding wall-clock target. This makes the run duration approximate the original capture span.
-- **Fast mode**: Setting `FAST_EVENTS` skips sleeps in the reader thread, filling frames as fast as IO and decoding allow.
+- **Realtime event pacing**: The reader thread derives microsecond deltas from the first event timestamp and sleeps until the corresponding wall-clock target. This makes the run duration approximate the original capture span.
 
 ## Frame Lifecycle
-1. Accumulate events (pixel coloring) into `frame` during the current interval.
-2. At frame boundary (render iteration): copy to local `display` then clear the shared `frame`.
-3. Display `display` and overlay stats.
-4. Begin new accumulation window.
-
-This produces a live strobing view of recent activity rather than a cumulative trace. Removing the clear step would turn the visualization into a persistent density map.
+1. Accumulate events by incrementing `counts(y, x)` for each event.
+2. At render time: build a binary mask (`counts >= threshold`) and set those pixels to white in `display`.
+3. Clear `counts` to zero to start a fresh frame.
+4. Overlay stats and show.
 
 ## Event Decoding Details
 Each 8-byte record contains two 32-bit little-endian words:
@@ -119,15 +119,12 @@ Meson/Ninja build places executable at `build/peltipoliisi2`.
 
 Run (realtime pacing):
 ```bash
-./build/peltipoliisi2
+./build/peltipoliisi2 data/your_file.dat [threshold]
 ```
-Fast mode (no pacing sleeps):
+Examples:
 ```bash
-FAST_EVENTS=1 ./build/peltipoliisi2
-```
-Optional alternate file:
-```bash
-./build/peltipoliisi2 data/your_file.dat
+./build/peltipoliisi2 data/drone_idle.dat           # default threshold (10)
+./build/peltipoliisi2 data/drone_idle.dat 25        # use threshold 25
 ```
 
 ## Summary
