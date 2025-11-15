@@ -6,6 +6,8 @@
 #include <atomic>
 #include <chrono>
 #include <vector>
+#include <array>
+#include <condition_variable>
 #include <fstream>
 #include <string>
 #include <cmath>
@@ -45,7 +47,139 @@ struct FrameState {
   atomic<u64> events_since_clear{0};
   double cluster_eps{6.5};
   size_t cluster_min_points{12};
+  // Background clustering communication
+  std::mutex cluster_request_mtx;
+  std::condition_variable cluster_request_cv;
+  std::vector<double> cluster_request_coords;
+  std::vector<FrameState::FrameEvent> cluster_request_events;
+  u64 cluster_request_frame{0};
+  bool cluster_request_ready{false};
+  std::mutex overlay_mtx;
+  struct ClusterOverlay {
+    cv::Rect box;
+    double rpm = std::numeric_limits<double>::quiet_NaN();
+    cv::Scalar color{0, 0, 255};
+  };
+  std::vector<ClusterOverlay> overlay_data;
+  u64 overlay_frame{0};
 } fs;
+
+std::thread cluster_thread;
+
+double estimate_rpm_from_events(const std::vector<FrameState::FrameEvent> &events);
+
+void cluster_worker() {
+  std::vector<double> coords;
+  std::vector<FrameState::FrameEvent> events;
+  while (true) {
+    u64 frame_id = 0;
+    {
+      std::unique_lock<std::mutex> lk(fs.cluster_request_mtx);
+      fs.cluster_request_cv.wait(lk, [] {
+        return fs.cluster_request_ready || !fs.running.load();
+      });
+      if (!fs.cluster_request_ready && !fs.running.load()) break;
+      coords.swap(fs.cluster_request_coords);
+      events.swap(fs.cluster_request_events);
+      frame_id = fs.cluster_request_frame;
+      fs.cluster_request_ready = false;
+    }
+
+    std::vector<FrameState::ClusterOverlay> overlays;
+    const size_t point_count = coords.size() / 2;
+    if (point_count >= fs.cluster_min_points) {
+      try {
+        arma::mat data(coords.data(), 2, point_count, false, true);
+        mlpack::DBSCAN<> clusterer(fs.cluster_eps, fs.cluster_min_points);
+        arma::Row<size_t> assignments;
+        clusterer.Cluster(data, assignments);
+
+        struct Bounds {
+          int min_x = std::numeric_limits<int>::max();
+          int min_y = std::numeric_limits<int>::max();
+          int max_x = std::numeric_limits<int>::min();
+          int max_y = std::numeric_limits<int>::min();
+          bool initialized = false;
+        };
+        std::unordered_map<size_t, Bounds> aggregates;
+        aggregates.reserve(point_count);
+
+        for (size_t idx = 0; idx < point_count; ++idx) {
+          const size_t label = assignments[idx];
+          if (label == std::numeric_limits<size_t>::max()) continue;
+          Bounds &b = aggregates[label];
+          int px = static_cast<int>(coords[2 * idx]);
+          int py = static_cast<int>(coords[2 * idx + 1]);
+          if (!b.initialized) {
+            b.min_x = b.max_x = px;
+            b.min_y = b.max_y = py;
+            b.initialized = true;
+          } else {
+            b.min_x = std::min(b.min_x, px);
+            b.min_y = std::min(b.min_y, py);
+            b.max_x = std::max(b.max_x, px);
+            b.max_y = std::max(b.max_y, py);
+          }
+        }
+
+        std::vector<std::pair<size_t, Bounds>> clusters;
+        clusters.reserve(aggregates.size());
+        for (auto &entry : aggregates) {
+          if (!entry.second.initialized) continue;
+          clusters.emplace_back(entry.first, entry.second);
+        }
+        std::sort(clusters.begin(), clusters.end(),
+                  [](const auto &a, const auto &b) {
+                    return a.first < b.first;
+                  });
+
+        static const std::array<cv::Scalar, 8> palette = {
+            cv::Scalar(0, 0, 255),
+            cv::Scalar(0, 255, 0),
+            cv::Scalar(255, 0, 0),
+            cv::Scalar(0, 255, 255),
+            cv::Scalar(255, 0, 255),
+            cv::Scalar(255, 255, 0),
+            cv::Scalar(128, 255, 0),
+            cv::Scalar(0, 128, 255)
+        };
+
+        overlays.reserve(clusters.size());
+        for (size_t idx = 0; idx < clusters.size(); ++idx) {
+          const auto &b = clusters[idx].second;
+          FrameState::ClusterOverlay overlay;
+          overlay.box = cv::Rect(cv::Point(b.min_x, b.min_y),
+                                 cv::Point(b.max_x + 1, b.max_y + 1));
+          overlay.color = palette[idx % palette.size()];
+
+          std::vector<FrameState::FrameEvent> local;
+          local.reserve(128);
+          for (const auto &ev : events) {
+            if (overlay.box.contains(cv::Point(ev.x, ev.y))) {
+              local.push_back(ev);
+            }
+          }
+          if (local.size() >= 16) {
+            double rpm = estimate_rpm_from_events(local);
+            if (std::isfinite(rpm) && rpm > 0.0) overlay.rpm = rpm;
+          }
+          overlays.push_back(std::move(overlay));
+        }
+      } catch (const std::exception &ex) {
+        std::cerr << "[cluster-worker] DBSCAN failed: " << ex.what() << std::endl;
+      }
+    }
+
+    {
+      std::lock_guard<std::mutex> lk(fs.overlay_mtx);
+      fs.overlay_data = std::move(overlays);
+      fs.overlay_frame = frame_id;
+    }
+
+    coords.clear();
+    events.clear();
+  }
+}
 
 // OpenCV mouse callback: update cursor coordinates (in window coords)
 static void on_mouse(int event, int x, int y, int /*flags*/, void* /*userdata*/) {
@@ -87,6 +221,7 @@ void run_dat_reader(const string &dat_path) {
     std::cerr << "[reader] failed to stream events from " << dat_path << std::endl;
   }
   fs.running.store(false);
+  fs.cluster_request_cv.notify_all();
 }
 
 // Number of blades on the propeller (adjust if needed)
@@ -94,7 +229,10 @@ static const int NUM_BLADES = 2;
 
 // Estimate RPM from timestamps (µs) of events in a small region using FFTW.
 // Returns NaN if not enough data or no clear peak.
+std::mutex fftw_mutex;
+
 double estimate_rpm_from_events(const std::vector<FrameState::FrameEvent> &events) {
+  std::lock_guard<std::mutex> fftw_lock(fftw_mutex);
   const size_t N = events.size();
   if (N < 16) return std::numeric_limits<double>::quiet_NaN(); // not enough events
 
@@ -199,9 +337,9 @@ bool render_frame(FrameState &fs) {
   struct SamplePoint { int x; int y; };
   std::vector<SamplePoint> sample_points;
   std::vector<FrameState::FrameEvent> frame_events_copy; // snapshot for RPM calc outside the lock
-  std::vector<cv::Rect> cluster_boxes;
   std::vector<double> cluster_coords;
   cluster_coords.reserve(4096);
+  u64 frame_id_for_workers = 0;
 
   {
     lock_guard<mutex> lk(fs.mtx);
@@ -241,58 +379,9 @@ bool render_frame(FrameState &fs) {
       }
     }
 
-    if (!cluster_coords.empty()) {
-      const size_t point_count = cluster_coords.size() / 2;
-      if (point_count >= fs.cluster_min_points) {
-        arma::mat data(cluster_coords.data(), 2, point_count, /*copy_aux_mem*/ false, /*strict*/ true);
-        mlpack::DBSCAN<> clusterer(fs.cluster_eps, fs.cluster_min_points);
-        arma::Row<size_t> assignments;
-        clusterer.Cluster(data, assignments);
-
-        struct Bounds {
-          int min_x = std::numeric_limits<int>::max();
-          int min_y = std::numeric_limits<int>::max();
-          int max_x = std::numeric_limits<int>::min();
-          int max_y = std::numeric_limits<int>::min();
-          bool initialized = false;
-        };
-
-        std::unordered_map<size_t, Bounds> boxes;
-        boxes.reserve(point_count);
-
-        for (size_t idx = 0; idx < point_count; ++idx) {
-          const size_t label = assignments[idx];
-          if (label == std::numeric_limits<size_t>::max()) continue; // noise
-
-          const int px = static_cast<int>(cluster_coords[2 * idx]);
-          const int py = static_cast<int>(cluster_coords[2 * idx + 1]);
-          auto &b = boxes[label];
-          if (!b.initialized) {
-            b.min_x = b.max_x = px;
-            b.min_y = b.max_y = py;
-            b.initialized = true;
-          } else {
-            b.min_x = std::min(b.min_x, px);
-            b.min_y = std::min(b.min_y, py);
-            b.max_x = std::max(b.max_x, px);
-            b.max_y = std::max(b.max_y, py);
-          }
-        }
-
-        std::vector<cv::Rect> boxes_local;
-        boxes_local.reserve(boxes.size());
-        for (const auto &entry : boxes) {
-          const auto &b = entry.second;
-          if (!b.initialized) continue;
-          boxes_local.emplace_back(cv::Point(b.min_x, b.min_y),
-                                   cv::Point(b.max_x + 1, b.max_y + 1));
-        }
-        cluster_boxes = std::move(boxes_local);
-      }
-    }
-
     // Take a snapshot of frame_events for use outside the lock (we're about to clear)
     frame_events_copy = fs.frame_events;
+    frame_id_for_workers = fs.frame_index.load(memory_order_relaxed);
 
     // ---- existing dump-to-file logic (unchanged) ----
     for (const auto &req : fs.dump_requests) {
@@ -349,7 +438,6 @@ bool render_frame(FrameState &fs) {
       if (std::isfinite(rpm) && rpm > 0.0) rpms.push_back(rpm);
     }
   }
-
   double median_rpm = std::numeric_limits<double>::quiet_NaN();
   if (!rpms.empty()) {
     size_t mid = rpms.size() / 2;
@@ -364,8 +452,28 @@ bool render_frame(FrameState &fs) {
     }
   }
 
-  for (const auto &rect : cluster_boxes) {
-    cv::rectangle(display, rect, cv::Scalar(0, 0, 255), 2);
+  if (!cluster_coords.empty()) {
+    bool posted_cluster_request = false;
+    {
+      std::lock_guard<std::mutex> req_lk(fs.cluster_request_mtx);
+      if (!fs.cluster_request_ready) {
+        fs.cluster_request_coords = std::move(cluster_coords);
+        fs.cluster_request_events = std::move(frame_events_copy);
+        fs.cluster_request_frame = frame_id_for_workers;
+        fs.cluster_request_ready = true;
+        posted_cluster_request = true;
+      }
+    }
+    if (posted_cluster_request) fs.cluster_request_cv.notify_one();
+  }
+
+  std::vector<FrameState::ClusterOverlay> overlays_copy;
+  {
+    std::lock_guard<std::mutex> lk(fs.overlay_mtx);
+    overlays_copy = fs.overlay_data;
+  }
+  for (const auto &overlay : overlays_copy) {
+    cv::rectangle(display, overlay.box, overlay.color, 2);
   }
 
   // Overlay text
@@ -377,17 +485,49 @@ bool render_frame(FrameState &fs) {
               cv::FONT_HERSHEY_SIMPLEX, 0.5,
               cv::Scalar(0,255,0), 1, cv::LINE_AA);
 
-  // RPM overlay in corner: show median of sampled points
-  string rpm_text;
+  // RPM overlay block
+  int rpm_block_y = 45;
+  auto put_line = [&](const std::string &line,
+                      const cv::Scalar &text_color = cv::Scalar(0, 255, 255),
+                      const cv::Scalar *marker = nullptr) {
+    if (marker) {
+      cv::rectangle(display,
+                    cv::Point(10, rpm_block_y - 12),
+                    cv::Point(22, rpm_block_y - 2),
+                    *marker, cv::FILLED);
+      cv::putText(display, line, cv::Point(26, rpm_block_y),
+                  cv::FONT_HERSHEY_SIMPLEX, 0.5,
+                  text_color, 1, cv::LINE_AA);
+    } else {
+      cv::putText(display, line, cv::Point(10, rpm_block_y),
+                  cv::FONT_HERSHEY_SIMPLEX, 0.55,
+                  text_color, 1, cv::LINE_AA);
+    }
+    rpm_block_y += 18;
+  };
+
   if (!std::isfinite(median_rpm) || median_rpm <= 0.0) {
-    rpm_text = "RPM (median of samples): N/A";
+    put_line("Global RPM: N/A");
   } else {
-    rpm_text = "RPM (median of samples): " + to_string(static_cast<int>(std::round(median_rpm))) +
-               "  (n=" + to_string(sample_points.size()) + "/valid=" + to_string(rpms.size()) + ")";
+    put_line("Global RPM: " + std::to_string(static_cast<int>(std::round(median_rpm))) +
+             " (" + std::to_string(rpms.size()) + " samples)");
   }
-  cv::putText(display, rpm_text, cv::Point(10, 45),
-              cv::FONT_HERSHEY_SIMPLEX, 0.6,
-              cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
+
+  if (overlays_copy.empty()) {
+    put_line("Clusters: none");
+  } else {
+    put_line("Clusters:");
+    for (size_t i = 0; i < overlays_copy.size(); ++i) {
+      const auto &overlay = overlays_copy[i];
+      std::string line = "#" + std::to_string(i) + ": ";
+      if (std::isfinite(overlay.rpm)) {
+        line += std::to_string(static_cast<int>(std::round(overlay.rpm))) + " RPM";
+      } else {
+        line += "RPM N/A";
+      }
+      put_line(line, overlay.color, &overlay.color);
+    }
+  }
 
   if (total == 0) {
     cv::putText(display, "(no events yet - file reading or pacing)", cv::Point(10,70),
@@ -427,6 +567,7 @@ int main(int argc, char **argv) {
   cv::setMouseCallback("Events", on_mouse, nullptr);
 
   thread reader(run_dat_reader, dat_path);
+  cluster_thread = std::thread(cluster_worker);
 
   auto frame_interval = chrono::duration_cast<steady::duration>(chrono::duration<double>(1.0/TARGET_FPS));
   auto next_frame = steady::now();
@@ -435,6 +576,9 @@ int main(int argc, char **argv) {
     if (!render_frame(fs)) break;
     this_thread::sleep_until(next_frame);
   }
+  fs.running.store(false);
+  fs.cluster_request_cv.notify_all();
   if (reader.joinable()) reader.join();
+  if (cluster_thread.joinable()) cluster_thread.join();
   return 0;
 }
