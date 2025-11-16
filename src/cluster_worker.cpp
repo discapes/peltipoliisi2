@@ -1,25 +1,11 @@
 // Event visualizer (30 FPS) – color white when a pixel sees >= threshold events.
-#include <iostream>
-#include <opencv2/opencv.hpp>
-#include <thread>
-#include <mutex>
-#include <atomic>
-#include <chrono>
-#include <vector>
-#include <fstream>
-#include <string>
-#include <cmath>
-#include <algorithm>
-#include <limits>
-#include <random>
-#include <fftw3.h>
-
-#include <array>
-#include <condition_variable>
-#include <unordered_map>
-#include <mlpack/core.hpp>
-#include <mlpack/methods/dbscan/dbscan.hpp>
 #include "defs.hpp"
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wpedantic"
+#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+#pragma GCC diagnostic ignored "-Wunknown-pragmas"
+#include <mlpack/methods/dbscan/dbscan.hpp>
+#pragma GCC diagnostic pop
 
 void cluster_worker() {
   vector<double> coords;
