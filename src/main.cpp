@@ -2,9 +2,11 @@
 #include "defs.hpp"
 #include <random>
 
-const int DEFAULT_W = 1280;
-const int DEFAULT_H = 720;
+constexpr int DEFAULT_W = 1280;
+constexpr int DEFAULT_H = 720;
 constexpr int CLUSTER_BOX_PADDING = 6;
+constexpr int SLIDING_WINDOW_US = 50'000;
+constexpr int EVENT_COUNT_THRESHOLD = 10;
 const double TARGET_FPS = 30.0;
 using steady = chrono::steady_clock;
 
@@ -29,7 +31,7 @@ inline void event_pixel_callback(const FrameEvent &e, int delta) {
 void run_dat_reader(const string &dat_path) {
   DatHeaderInfo header;
   // Uses default 50ms window; stream emits +1 on arrival and -1 on expiry.
-  stream_dat_events(dat_path, event_pixel_callback, &header, 50'000);
+  stream_dat_events(dat_path, event_pixel_callback, &header, SLIDING_WINDOW_US);
   fs.running.store(false);
   fs.cluster_request_cv.notify_all();
 }
@@ -45,14 +47,13 @@ FrameState::RpmStats compute_rpm_stats_from_counts() {
   vector<double> cluster_coords;
   cluster_coords.reserve(4096);
   u64 frame_id_for_workers = 0;
-  int counts_rows = 0, counts_cols = 0, threshold = 0;
+  int counts_rows = 0, counts_cols = 0;
 
   {
     lock_guard<mutex> lk(fs.mtx);
     if (fs.counts.empty()) return stats;
     counts_rows = fs.counts.rows;
     counts_cols = fs.counts.cols;
-    threshold = fs.threshold;
 
     constexpr int K = 10;
     sample_points.reserve(K);
@@ -64,7 +65,7 @@ FrameState::RpmStats compute_rpm_stats_from_counts() {
     for (int y = 0; y < counts_rows; ++y) {
       const int *row = fs.counts.ptr<int>(y);
       for (int x = 0; x < counts_cols; ++x) {
-        if (row[x] >= threshold) {
+        if (row[x] >= EVENT_COUNT_THRESHOLD) {
           cluster_coords.push_back(static_cast<double>(x));
           cluster_coords.push_back(static_cast<double>(y));
           ++seen;
@@ -166,7 +167,7 @@ bool render_frame() {
 
     // Build mask where counts >= threshold and set those pixels to white.
     cv::Mat mask;
-    cv::compare(fs.counts, fs.threshold, mask, cv::CMP_GE); // mask: 255 where true
+    cv::compare(fs.counts, EVENT_COUNT_THRESHOLD, mask, cv::CMP_GE); // mask: 255 where true
     display.setTo(cv::Scalar(255,255,255), mask);
     rpm_stats_copy = fs.rpm_stats; // snapshot under lock
   } // mutex unlocked here
@@ -246,18 +247,11 @@ bool render_frame() {
 
 int main(int argc, char **argv) {
   // Usage: program <DAT filepath> [threshold]
-  if (argc < 2 || argc > 3) {
-    cout << "Usage: " << argv[0] << " <DAT filepath> [threshold]\n";
+  if (argc < 2 || argc > 2) {
+    cout << "Usage: " << argv[0] << " <DAT filepath>\n";
     return 1;
   }
   string dat_path = argv[1];
-  if (argc == 3) {
-    try {
-      fs.threshold = max(1, stoi(argv[2]));
-    } catch (...) {
-      cerr << "Invalid threshold '" << argv[2] << "', using default " << fs.threshold << "\n";
-    }
-  }
   cout << "Event visualizer (30 FPS). File: " << dat_path << "\nESC/q to quit, C to clear.\n";
 
   fs.frame = cv::Mat(DEFAULT_H, DEFAULT_W, CV_8UC3, cv::Scalar(0,0,0));
