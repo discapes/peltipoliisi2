@@ -71,4 +71,13 @@ bool stream_dat_events(const string &path,
                        DatHeaderInfo *out_header=nullptr,
                        u32 window_us = 50'000);
 
-void cluster_worker();
+// Compute clusters and overlays from sampled coords and events.
+// - coords: packed [x0, y0, x1, y1, ...]
+// - events: events for the current interval
+// - cluster_eps, cluster_min_points: DBSCAN parameters
+// Returns a list of overlays (bounding boxes, colors, optional RPM per cluster).
+vector<FrameState::ClusterOverlay> cluster_worker(
+  vector<double> coords,
+  vector<FrameEvent> events,
+  double cluster_eps,
+  size_t cluster_min_points);

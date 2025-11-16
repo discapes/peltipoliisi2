@@ -8,7 +8,8 @@ constexpr int DEFAULT_H = 720;
 constexpr int CLUSTER_BOX_PADDING = 6;
 constexpr int SLIDING_WINDOW_US = 50'000;
 constexpr int EVENT_COUNT_THRESHOLD = 10;
-const double TARGET_FPS = 30.0;
+constexpr double TARGET_FPS = 30.0;
+constexpr double CLUSTER_FPS = 30.0;
 using steady = chrono::steady_clock;
 
 FrameState fs;
@@ -122,18 +123,13 @@ FrameState::RpmStats compute_rpm_stats_from_counts() {
     }
   }
   if (!cluster_coords.empty()) {
-    bool posted_cluster_request = false;
-    {
-      lock_guard<mutex> req_lk(fs.cluster_request_mtx);
-      if (!fs.cluster_request_ready) {
-        fs.cluster_request_coords = move(cluster_coords);
-        fs.cluster_request_events = move(events_snapshot);
-        fs.cluster_request_frame = frame_id_for_workers;
-        fs.cluster_request_ready = true;
-        posted_cluster_request = true;
-      }
-    }
-    if (posted_cluster_request) fs.cluster_request_cv.notify_one();
+    // Compute clusters synchronously and publish overlays
+    double eps = fs.cluster_eps;
+    size_t min_pts = fs.cluster_min_points;
+    auto overlays = cluster_worker(move(cluster_coords), move(events_snapshot), eps, min_pts);
+    lock_guard<mutex> lk(fs.overlay_mtx);
+    fs.overlay_data = move(overlays);
+    fs.overlay_frame = frame_id_for_workers;
   }
 
 
@@ -141,7 +137,7 @@ FrameState::RpmStats compute_rpm_stats_from_counts() {
 }
 
 void rpm_counter_loop() {
-  auto frame_interval = chrono::duration_cast<steady::duration>(chrono::duration<double>(1.0/10.0));
+  auto frame_interval = chrono::duration_cast<steady::duration>(chrono::duration<double>(1.0/CLUSTER_FPS));
   auto next_frame = steady::now();
   while (fs.running.load()) {
     next_frame += frame_interval;
@@ -261,7 +257,7 @@ int main(int argc, char **argv) {
 
   thread reader(run_dat_reader, dat_path);
   thread rpm_counter(rpm_counter_loop);
-  thread cluster_thread(cluster_worker);
+  // Background cluster thread removed; clustering is now invoked synchronously.
 
   auto frame_interval = chrono::duration_cast<steady::duration>(chrono::duration<double>(1.0/TARGET_FPS));
   auto next_frame = steady::now();
@@ -272,9 +268,7 @@ int main(int argc, char **argv) {
   }
 
   fs.running.store(false);
-  fs.cluster_request_cv.notify_all();
   if (reader.joinable()) reader.join();
   if (rpm_counter.joinable()) rpm_counter.join();
-  if (cluster_thread.joinable()) cluster_thread.join();
   return 0;
 }
