@@ -1,25 +1,6 @@
 // Event visualizer (30 FPS) – color white when a pixel sees >= threshold events.
-#include <iostream>
-#include <opencv2/opencv.hpp>
-#include <thread>
-#include <mutex>
-#include <atomic>
-#include <chrono>
-#include <vector>
-#include <fstream>
-#include <string>
-#include <cmath>
-#include <algorithm>
-#include <limits>
-#include <random>
-#include <fftw3.h>
-
-#include <array>
-#include <condition_variable>
-#include <unordered_map>
-#include <mlpack/core.hpp>
-#include <mlpack/methods/dbscan/dbscan.hpp>
 #include "defs.hpp"
+#include <random>
 
 const int DEFAULT_W = 1280;
 const int DEFAULT_H = 720;
@@ -48,7 +29,7 @@ inline void event_pixel_callback(const FrameEvent &e, int delta) {
 void run_dat_reader(const string &dat_path) {
   DatHeaderInfo header;
   // Uses default 50ms window; stream emits +1 on arrival and -1 on expiry.
-  bool ok = stream_dat_events(dat_path, event_pixel_callback, &header, 50'000);
+  stream_dat_events(dat_path, event_pixel_callback, &header, 50'000);
   fs.running.store(false);
   fs.cluster_request_cv.notify_all();
 }
@@ -175,8 +156,6 @@ void rpm_counter_loop() {
 bool render_frame() {
   cv::Mat display;
   cv::Mat counts_snapshot;
-  u64 frame_seed = 0;
-  int threshold = 0;
   FrameState::RpmStats rpm_stats_copy;
 
   {

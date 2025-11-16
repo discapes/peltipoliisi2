@@ -1,7 +1,3 @@
-#include <algorithm>
-#include <cmath>
-#include <limits>
-#include <vector>
 #include <fftw3.h>
 #include "defs.hpp"
 

@@ -22,6 +22,7 @@ exe = executable(
   ],
   install : true,
   dependencies : dependencies,
+  cpp_args : ['-pedantic', '-Wall', '-Wextra']
 )
 
 test('basic', exe)
