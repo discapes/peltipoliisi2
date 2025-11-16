@@ -12,6 +12,7 @@ constexpr double TARGET_FPS = 60.0;
 constexpr double CLUSTER_FPS = 20.0;
 constexpr int SAMPLE_POINTS = 200;
 constexpr int SAMPLE_RANGE = 1;
+constexpr int NUM_BLADES = 2;
 using steady = chrono::steady_clock;
 
 FrameState fs;
@@ -108,7 +109,7 @@ FrameState::RpmStats compute_rpm_stats_from_counts() {
       }
     }
     if (local.size() >= 16) {
-      double rpm = estimate_rpm_from_events(local, 2);
+      double rpm = estimate_rpm_from_events(local, NUM_BLADES);
       if (isfinite(rpm) && rpm > 0.0) {
         rpms.push_back(rpm);
         rpm_samples.push_back(RpmSample{sp.x, sp.y, rpm});
@@ -154,13 +155,78 @@ FrameState::RpmStats compute_rpm_stats_from_counts() {
     size_t min_pts = fs.cluster_min_points;
     auto overlays = cluster_worker(move(cluster_coords), move(rpm_samples), eps, min_pts);
     lock_guard<mutex> lk(fs.overlay_mtx);
-    fs.overlay_data = move(overlays);
+    fs.overlay_data = std::move(overlays);
     fs.overlay_frame = frame_id_for_workers;
   }
 
 
   return stats;
 }
+
+void update_rotor_tracking(vector<FrameState::ClusterOverlay> &new_overlays) {
+  // Simple IoU based tracking
+  const double iou_threshold = 0.3;
+  vector<bool> matched_new(new_overlays.size(), false);
+
+  lock_guard<mutex> lk(fs.mtx);
+
+  // Increment unseen counters and remove old trackers
+  for (auto &rotor : fs.tracked_rotors) {
+    rotor.frames_unseen++;
+  }
+  fs.tracked_rotors.erase(
+      remove_if(fs.tracked_rotors.begin(), fs.tracked_rotors.end(),
+                [](const auto &r) { return r.frames_unseen > 5; }),
+      fs.tracked_rotors.end());
+
+  // Match existing trackers to new overlays
+  for (auto &rotor : fs.tracked_rotors) {
+    double best_iou = 0;
+    int best_match_idx = -1;
+
+    for (size_t i = 0; i < new_overlays.size(); ++i) {
+      if (matched_new[i]) continue;
+      double iou = (double)(rotor.box & new_overlays[i].box).area() /
+                   (double)(rotor.box | new_overlays[i].box).area();
+      if (iou > best_iou) {
+        best_iou = iou;
+        best_match_idx = i;
+      }
+    }
+
+    if (best_match_idx != -1 && best_iou > iou_threshold) {
+      rotor.box = new_overlays[best_match_idx].box;
+      if (isfinite(new_overlays[best_match_idx].rpm)) {
+        rotor.rpm_history.push_back(new_overlays[best_match_idx].rpm);
+        while (rotor.rpm_history.size() > fs.RPM_HISTORY_SIZE) {
+          rotor.rpm_history.pop_front();
+        }
+      }
+      rotor.frames_unseen = 0;
+      matched_new[best_match_idx] = true;
+    }
+  }
+
+  // Add new trackers for unmatched overlays
+  static const array<cv::Scalar, 8> palette = {
+      cv::Scalar(0, 0, 255),   cv::Scalar(0, 255, 0),   cv::Scalar(255, 0, 0),
+      cv::Scalar(0, 255, 255), cv::Scalar(255, 0, 255), cv::Scalar(255, 255, 0),
+      cv::Scalar(128, 255, 0), cv::Scalar(0, 128, 255)};
+
+  for (size_t i = 0; i < new_overlays.size(); ++i) {
+    if (!matched_new[i]) {
+      FrameState::TrackedRotor new_rotor;
+      new_rotor.id = fs.next_rotor_id++;
+      new_rotor.box = new_overlays[i].box;
+      new_rotor.color = palette[new_rotor.id % palette.size()];
+      if (isfinite(new_overlays[i].rpm)) {
+        new_rotor.rpm_history.push_back(new_overlays[i].rpm);
+      }
+      fs.tracked_rotors.push_back(new_rotor);
+    }
+  }
+}
+
 
 void rpm_counter_loop() {
   auto frame_interval = chrono::duration_cast<steady::duration>(chrono::duration<double>(1.0/CLUSTER_FPS));
@@ -172,6 +238,14 @@ void rpm_counter_loop() {
       lock_guard<mutex> lk(fs.mtx);
       fs.rpm_stats = stats;
     }
+
+    vector<FrameState::ClusterOverlay> overlays_copy;
+    {
+      lock_guard<mutex> lk(fs.overlay_mtx);
+      overlays_copy = fs.overlay_data;
+    }
+    update_rotor_tracking(overlays_copy);
+
     this_thread::sleep_until(next_frame);
   }
 }
@@ -181,6 +255,7 @@ bool render_frame() {
   cv::Mat display;
   cv::Mat counts_snapshot;
   FrameState::RpmStats rpm_stats_copy;
+  vector<FrameState::TrackedRotor> tracked_rotors_copy;
 
   {
     lock_guard<mutex> lk(fs.mtx);
@@ -193,23 +268,20 @@ bool render_frame() {
     cv::compare(fs.counts, EVENT_COUNT_THRESHOLD, mask, cv::CMP_GE); // mask: 255 where true
     display.setTo(cv::Scalar(255,255,255), mask);
     rpm_stats_copy = fs.rpm_stats; // snapshot under lock
+    
+    // Snapshot tracked rotors for rendering
+    tracked_rotors_copy = fs.tracked_rotors;
   } // mutex unlocked here
 
-
-   vector<FrameState::ClusterOverlay> overlays_copy;
-  {
-    lock_guard<mutex> lk(fs.overlay_mtx);
-    overlays_copy = fs.overlay_data;
-  }
-  for (const auto &overlay : overlays_copy) {
-    cv::Rect padded = overlay.box;
+  for (const auto &rotor : tracked_rotors_copy) {
+    cv::Rect padded = rotor.box;
     padded.x = max(0, padded.x - CLUSTER_BOX_PADDING);
     padded.y = max(0, padded.y - CLUSTER_BOX_PADDING);
     padded.width = min(display.cols - padded.x,
-                            overlay.box.width + 2 * CLUSTER_BOX_PADDING);
+                            rotor.box.width + 2 * CLUSTER_BOX_PADDING);
     padded.height = min(display.rows - padded.y,
-                             overlay.box.height + 2 * CLUSTER_BOX_PADDING);
-    cv::rectangle(display, padded, overlay.color, 2);
+                             rotor.box.height + 2 * CLUSTER_BOX_PADDING);
+    cv::rectangle(display, padded, rotor.color, 2);
   }
 
   int rpm_block_y = 45;
@@ -240,19 +312,66 @@ bool render_frame() {
              " (" + to_string(rpm_stats_copy.sampled) + " samples)");
   }
 
-  if (overlays_copy.empty()) {
+  if (tracked_rotors_copy.empty()) {
     put_line("Clusters: none");
   } else {
     put_line("Clusters:");
-    for (size_t i = 0; i < overlays_copy.size(); ++i) {
-      const auto &overlay = overlays_copy[i];
-      string line = "#" + to_string(i) + ": ";
-      if (isfinite(overlay.rpm)) {
-        line += to_string(static_cast<int>(round(overlay.rpm))) + " RPM";
+    for (const auto &rotor : tracked_rotors_copy) {
+      string line = "#" + to_string(rotor.id) + ": ";
+      if (!rotor.rpm_history.empty() && isfinite(rotor.rpm_history.back())) {
+        line += to_string(static_cast<int>(round(rotor.rpm_history.back()))) + " RPM";
       } else {
         line += "RPM N/A";
       }
-      put_line(line, overlay.color, &overlay.color);
+      put_line(line, rotor.color, &rotor.color);
+
+      // Draw RPM history graph in sidebar
+      if (rotor.rpm_history.size() > 1) {
+        int graph_w = 150;
+        int graph_h = 40;
+        int text_margin = 5;
+
+        cv::Point graph_origin(10, rpm_block_y);
+        cv::Rect graph_rect(graph_origin, cv::Size(graph_w, graph_h));
+        cv::rectangle(display, graph_rect, cv::Scalar(100, 100, 100), 1);
+
+
+        // Find min/max RPM in history for scaling
+        double min_rpm = 0;
+        double max_rpm = 0;
+
+        for (double rpm : rotor.rpm_history) {
+          if (rpm > max_rpm) max_rpm = rpm;
+        }
+
+        max_rpm *= 1.5; // Add 20% padding
+
+        double rpm_range = max_rpm - min_rpm;
+        if (rpm_range < 500) rpm_range = 500;
+
+        vector<cv::Point> points;
+        points.reserve(rotor.rpm_history.size());
+        for (size_t i = 0; i < rotor.rpm_history.size(); ++i) {
+          int x = graph_origin.x + (int)((double)i / (fs.RPM_HISTORY_SIZE - 1) * graph_w);
+          int y = graph_origin.y + graph_h - (int)(((rotor.rpm_history[i] - min_rpm) / max_rpm) * graph_h);
+          points.emplace_back(x, y);
+        }
+        cv::polylines(display, points, false, rotor.color, 1, cv::LINE_AA);
+
+        // Y-axis label and ticks
+        cv::putText(display, "RPM", cv::Point(graph_origin.x, graph_origin.y - 5),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.3, cv::Scalar(200, 200, 200), 1, cv::LINE_AA);
+        cv::putText(display, to_string((int)max_rpm), cv::Point(graph_rect.br().x + text_margin, graph_origin.y + 10),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.3, cv::Scalar(200, 200, 200), 1, cv::LINE_AA);
+        cv::putText(display, to_string((int)min_rpm), cv::Point(graph_rect.br().x + text_margin, graph_origin.y + graph_h),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.3, cv::Scalar(200, 200, 200), 1, cv::LINE_AA);
+
+        // X-axis label
+        cv::putText(display, "Time", cv::Point(graph_origin.x + graph_w / 2 - 10, graph_rect.br().y + 12),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.3, cv::Scalar(200, 200, 200), 1, cv::LINE_AA);
+
+        rpm_block_y += graph_h + 30;
+      }
     }
   }
 

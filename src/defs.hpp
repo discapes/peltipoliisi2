@@ -51,6 +51,18 @@ struct FrameState {
   };
   vector<ClusterOverlay> overlay_data;
   u64 overlay_frame{0};
+
+  // Rotor tracking
+  struct TrackedRotor {
+    int id;
+    cv::Rect box;
+    cv::Scalar color;
+    deque<double> rpm_history;
+    int frames_unseen = 0;
+  };
+  vector<TrackedRotor> tracked_rotors;
+  int next_rotor_id = 0;
+  static constexpr int RPM_HISTORY_SIZE = 50;
 };
 extern FrameState fs;
 
