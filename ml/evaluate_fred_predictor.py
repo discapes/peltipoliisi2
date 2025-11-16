@@ -54,7 +54,12 @@ def evaluate(args: argparse.Namespace) -> None:
             num_layers != args.num_layers or hidden_size != args.hidden_size):
         print("Note: overriding architecture hyperparameters with checkpoint values.")
 
-    samples = load_samples(seq_ids, dataset_root, args.image_width, args.image_height)
+    samples = load_samples(seq_ids, dataset_root, args.image_width, args.image_height,
+                           event_window_us=10000,
+                           event_frame_height=720,
+                           event_frame_width=1280,
+                           cache_dir=None,
+                           use_cache=False)
     dataset = SlidingWindowDataset(samples,
                                    input_len,
                                    pred_len,
@@ -84,8 +89,11 @@ def evaluate(args: argparse.Namespace) -> None:
 
     with torch.no_grad():
         for batch in loader:
-            inputs, targets = (b.to(device) for b in batch)
-            preds = model(inputs)
+            pos_inputs, targets, event_inputs = batch
+            pos_inputs = pos_inputs.to(device)
+            targets = targets.to(device)
+            event_inputs = event_inputs.to(device)
+            preds = model(pos_inputs, event_inputs)
             mse, l2 = compute_metrics(preds, targets)
             mse_acc.append(mse.cpu())
             l2_acc.append(l2.cpu())

@@ -6,3 +6,4 @@ Requires-Python: >=3.10
 Description-Content-Type: text/markdown
 Requires-Dist: numpy>=1.24
 Requires-Dist: torch>=2.2
+Requires-Dist: expelliarmus>=1.0.0

@@ -8,6 +8,32 @@ resolution-markers = [
 ]
 
 [[package]]
+name = "expelliarmus"
+version = "1.1.12"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.3.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/43/9b/20a6ee4feea46e1977888cae1979ff87f32d17b51ad1348c82e198635c3d/expelliarmus-1.1.12.tar.gz", hash = "sha256:69978d115af857016b82a78387a4d78ee952ed802998b9cf778feb80393d2c3d", size = 28224 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/25/72/441be77b179d089b9215da8cfd959bb05dfe1d800d64bf15031ed7ab2c4d/expelliarmus-1.1.12-cp310-cp310-macosx_10_9_x86_64.whl", hash = "sha256:6040a4cee3f84499763a999e5797e608e968c0473f48c11482275476f6c3c27f", size = 26449 },
+    { url = "https://files.pythonhosted.org/packages/c4/8e/53c335cb780fd5ae5066faf52aac39a2231bf744eba0c5962fd7b6eea762/expelliarmus-1.1.12-cp310-cp310-manylinux_2_5_i686.manylinux1_i686.manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:eed18bb32bccc582d1d3abf47daffba65aaa23960fb105d35a4ab222fda8bcbc", size = 48654 },
+    { url = "https://files.pythonhosted.org/packages/e8/be/ef7924273a4d254be5dbc66a32ebb73fc739449aea71426cc489a8e103b3/expelliarmus-1.1.12-cp310-cp310-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:ff81b8afe170d1b365a2efb155361d01899429710357151f0447735f460319fb", size = 50424 },
+    { url = "https://files.pythonhosted.org/packages/71/ec/f1d790f929e1613b2e65d847f09ce0a6c4189571031bd75498893f7e9a8e/expelliarmus-1.1.12-cp310-cp310-musllinux_1_1_i686.whl", hash = "sha256:ae88761817363d0fc2cb427e1e4603b034dd1a8aa7953d18ff82fd3bf9c618a5", size = 48135 },
+    { url = "https://files.pythonhosted.org/packages/5a/f3/79f7b14154a559c6d20d72656999aa688dad3bdb878a4b3608b28546ae74/expelliarmus-1.1.12-cp310-cp310-musllinux_1_1_x86_64.whl", hash = "sha256:4994b4ce5f690198dc2b86b3e51fdb51d8459e4940340132b55d7c54f94f1338", size = 49576 },
+    { url = "https://files.pythonhosted.org/packages/3d/2a/169927c1a2a416de071ce75aba85593361125b8f34cc83a569aa8d93875f/expelliarmus-1.1.12-cp310-cp310-win32.whl", hash = "sha256:adc91cf689760acc56d1d8c8b35d1c1f94bb3195dbaa117c5287eba081b30569", size = 29488 },
+    { url = "https://files.pythonhosted.org/packages/51/82/bfb326cf8e8fc36bbacbdc4a308e0bddff2e9b9242001072c4d3d7b126b9/expelliarmus-1.1.12-cp310-cp310-win_amd64.whl", hash = "sha256:26e00512c24f5e7791435097829f39d9f38fbeba46b797607049ee2b22c42895", size = 31715 },
+    { url = "https://files.pythonhosted.org/packages/66/b3/802ec0ef4ee4de8c3ef09bab06b4cc730199eedb9dc0897a42b81ee2bca9/expelliarmus-1.1.12-cp311-cp311-macosx_10_9_x86_64.whl", hash = "sha256:4dc76e2e395274bf195c3f5ebe0eb14b84deed63fb41c9e2d6ba6a6d00efd5c8", size = 26444 },
+    { url = "https://files.pythonhosted.org/packages/51/69/0a1d62a703c938bf7cc609b0b72c752a50269d7eaad8030fe2640c76e356/expelliarmus-1.1.12-cp311-cp311-manylinux_2_5_i686.manylinux1_i686.manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:260dcec354a94136478e91ff307302472fd9e072c83409afc162f7bbca717a4e", size = 48655 },
+    { url = "https://files.pythonhosted.org/packages/fa/bf/8902cd710c34a28bb38e5a8a94a3957eede9d466265763d6288afa0aa27d/expelliarmus-1.1.12-cp311-cp311-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:3af2892ae68546630260a09292ccdd21dd23399a1e4ac8dfd7fc91dc34f2e4ce", size = 50423 },
+    { url = "https://files.pythonhosted.org/packages/52/f1/73e86560be24a984c7205df5675b618555474db1db5434864ae9b6beb4cd/expelliarmus-1.1.12-cp311-cp311-musllinux_1_1_i686.whl", hash = "sha256:84196b48cec9eab9a8f56c7dfe6fca6fd23fd36a5d644b186674bb56ce1dd0be", size = 48137 },
+    { url = "https://files.pythonhosted.org/packages/81/1a/94e5d8090a61aca2991388c6491df58b88ea07469d58004498d0e7a83fee/expelliarmus-1.1.12-cp311-cp311-musllinux_1_1_x86_64.whl", hash = "sha256:8a2e4d69de9d650ad29dca0d2aed25d4900a08610d800b87b3eead087b422dc7", size = 49579 },
+    { url = "https://files.pythonhosted.org/packages/46/d8/11bc6eb09bb5ae0f3818a6f02413d1b66434db76fc8982e6c2a304b48d8a/expelliarmus-1.1.12-cp311-cp311-win32.whl", hash = "sha256:0f3dc9943d9f1ca8c3fa2ba4278dae9b524f649b9f7505251d247d3fe55e5b65", size = 29488 },
+    { url = "https://files.pythonhosted.org/packages/bb/27/eebfa74e2982b379a2a81807612b6db5c4fc5fbd29e2e09dcc52edace2ff/expelliarmus-1.1.12-cp311-cp311-win_amd64.whl", hash = "sha256:ca8709dfebf869c80c54b9e31b42f64844268c0d6c263d9f33dbecd685d4e6bc", size = 31714 },
+]
+
+[[package]]
 name = "filelock"
 version = "3.20.0"
 source = { registry = "https://pypi.org/simple" }
@@ -21,6 +47,7 @@ name = "fred-trainer"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "expelliarmus" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.3.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "torch" },
@@ -28,6 +55,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "expelliarmus", specifier = ">=1.0.0" },
     { name = "numpy", specifier = ">=1.24" },
     { name = "torch", specifier = ">=2.2" },
 ]

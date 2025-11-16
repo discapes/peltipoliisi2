@@ -1,7 +1,9 @@
 // Event visualizer (30 FPS) – color white when a pixel sees >= threshold events.
 #include <cstdint>
+#include <condition_variable>
 #include <mutex>
 #include <vector>
+#include <thread>
 #include <opencv2/opencv.hpp>
 #include <torch/script.h>
 #include <deque>
@@ -138,6 +140,7 @@ struct TrajectoryPredictorConfig
   int pred_len = 10;
   float image_width = static_cast<float>(DEFAULT_W);
   float image_height = static_cast<float>(DEFAULT_H);
+  int event_window_us = 10000;  // 10ms window for event accumulation
 };
 
 class TrajectoryPredictor
@@ -146,6 +149,7 @@ public:
   bool load(const TrajectoryPredictorConfig &cfg, std::string *error_msg = nullptr);
   void reset();
   void add_observation(const cv::Point2f &pixel);
+  ~TrajectoryPredictor();
 
   std::vector<cv::Point2f> latest_prediction_pixels() const;
   std::vector<cv::Point2f> observation_trace_pixels() const;
@@ -153,18 +157,36 @@ public:
   int pred_len() const;
 
 private:
-  void run_inference_locked();
+  void request_inference_locked();
+  void inference_thread_loop();
+  std::vector<cv::Point2f> run_inference(const std::vector<cv::Point2f> &history_norm,
+                                         const std::vector<cv::Point2f> &history_pixels,
+                                         const std::vector<FrameEvent> &active_events,
+                                         float image_width,
+                                         float image_height,
+                                         int input_len,
+                                         int pred_len,
+                                         bool use_events);
+  void ensure_worker();
+  void stop_worker();
 
   mutable std::mutex mtx_;
+  std::condition_variable cv_;
   bool loaded_{false};
   int input_len_{0};
   int pred_len_{0};
+  int event_window_us_{10000};
   float image_width_{static_cast<float>(DEFAULT_W)};
   float image_height_{static_cast<float>(DEFAULT_H)};
+  bool model_use_events_{true};
+  bool use_events_{true};
   std::deque<cv::Point2f> history_norm_;
   std::deque<cv::Point2f> history_pixels_;
   std::vector<cv::Point2f> last_prediction_pixels_;
   torch::jit::script::Module module_;
+  std::thread inference_thread_;
+  bool stop_worker_{false};
+  bool pending_inference_{false};
 };
 
 extern TrajectoryPredictor g_trajectory_predictor;
