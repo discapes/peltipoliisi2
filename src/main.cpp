@@ -8,8 +8,10 @@ constexpr int DEFAULT_H = 720;
 constexpr int CLUSTER_BOX_PADDING = 6;
 constexpr int SLIDING_WINDOW_US = 50'000;
 constexpr int EVENT_COUNT_THRESHOLD = 10;
-constexpr double TARGET_FPS = 30.0;
-constexpr double CLUSTER_FPS = 30.0;
+constexpr double TARGET_FPS = 60.0;
+constexpr double CLUSTER_FPS = 20.0;
+constexpr int SAMPLE_POINTS = 200;
+constexpr int SAMPLE_RANGE = 1;
 using steady = chrono::steady_clock;
 
 FrameState fs;
@@ -46,6 +48,7 @@ FrameState::RpmStats compute_rpm_stats_from_counts() {
   struct SamplePoint { int x; int y; };
   vector<SamplePoint> sample_points;
   vector<FrameEvent> events_snapshot;
+  vector<RpmSample> rpm_samples; // precomputed per-point RPMs for clusters
   vector<double> cluster_coords;
   cluster_coords.reserve(4096);
   u64 frame_id_for_workers = 0;
@@ -57,8 +60,7 @@ FrameState::RpmStats compute_rpm_stats_from_counts() {
     counts_rows = fs.counts.rows;
     counts_cols = fs.counts.cols;
 
-    constexpr int K = 10;
-    sample_points.reserve(K);
+    sample_points.reserve(SAMPLE_POINTS);
     static int frame_seed = 0;
     mt19937 rng(static_cast<u32>(frame_seed++) ^ 0x9e3779b9u);
     uniform_real_distribution<double> uni01(0.0, 1.0);
@@ -71,11 +73,11 @@ FrameState::RpmStats compute_rpm_stats_from_counts() {
           cluster_coords.push_back(static_cast<double>(x));
           cluster_coords.push_back(static_cast<double>(y));
           ++seen;
-          if (static_cast<int>(sample_points.size()) < K) {
+          if (static_cast<int>(sample_points.size()) < SAMPLE_POINTS) {
             sample_points.push_back({x, y});
           } else {
             long long r = static_cast<long long>(floor(uni01(rng) * seen));
-            if (r < K) sample_points[static_cast<size_t>(r)] = {x, y};
+            if (r < SAMPLE_POINTS) sample_points[static_cast<size_t>(r)] = {x, y};
           }
         }
       }
@@ -91,11 +93,12 @@ FrameState::RpmStats compute_rpm_stats_from_counts() {
 
   vector<double> rpms;
   rpms.reserve(sample_points.size());
+  rpm_samples.reserve(sample_points.size());
   for (const auto &sp : sample_points) {
-    const int x0 = max(0, sp.x - 1);
-    const int x1 = min(counts_cols - 1, sp.x + 1);
-    const int y0 = max(0, sp.y - 1);
-    const int y1 = min(counts_rows - 1, sp.y + 1);
+    const int x0 = max(0, sp.x - SAMPLE_RANGE);
+    const int x1 = min(counts_cols - 1, sp.x + SAMPLE_RANGE);
+    const int y0 = max(0, sp.y - SAMPLE_RANGE);
+    const int y1 = min(counts_rows - 1, sp.y + SAMPLE_RANGE);
 
     vector<FrameEvent> local;
     local.reserve(64);
@@ -106,7 +109,10 @@ FrameState::RpmStats compute_rpm_stats_from_counts() {
     }
     if (local.size() >= 16) {
       double rpm = estimate_rpm_from_events(local, 2);
-      if (isfinite(rpm) && rpm > 0.0) rpms.push_back(rpm);
+      if (isfinite(rpm) && rpm > 0.0) {
+        rpms.push_back(rpm);
+        rpm_samples.push_back(RpmSample{sp.x, sp.y, rpm});
+      }
     }
   }
 
@@ -122,11 +128,31 @@ FrameState::RpmStats compute_rpm_stats_from_counts() {
       stats.median = 0.5 * (a + b);
     }
   }
+  // Temporal smoothing: maintain a short history and use its median.
+  if (isfinite(stats.median) && stats.median > 0.0) {
+    lock_guard<mutex> lk(fs.mtx);
+    fs.rpm_median_history.push_back(stats.median);
+    if (fs.rpm_median_history.size() > fs.rpm_median_history_limit) {
+      fs.rpm_median_history.erase(fs.rpm_median_history.begin());
+    }
+    if (!fs.rpm_median_history.empty()) {
+      vector<double> h = fs.rpm_median_history;
+      size_t hmid = h.size() / 2;
+      nth_element(h.begin(), h.begin() + hmid, h.end());
+      if (h.size() % 2 == 1) {
+        stats.median = h[hmid];
+      } else {
+        double ha = *max_element(h.begin(), h.begin() + hmid);
+        double hb = h[hmid];
+        stats.median = 0.5 * (ha + hb);
+      }
+    }
+  }
   if (!cluster_coords.empty()) {
     // Compute clusters synchronously and publish overlays
     double eps = fs.cluster_eps;
     size_t min_pts = fs.cluster_min_points;
-    auto overlays = cluster_worker(move(cluster_coords), move(events_snapshot), eps, min_pts);
+    auto overlays = cluster_worker(move(cluster_coords), move(rpm_samples), eps, min_pts);
     lock_guard<mutex> lk(fs.overlay_mtx);
     fs.overlay_data = move(overlays);
     fs.overlay_frame = frame_id_for_workers;
