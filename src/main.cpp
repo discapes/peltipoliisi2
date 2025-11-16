@@ -1,6 +1,7 @@
 // Event visualizer (30 FPS) – color white when a pixel sees >= threshold events.
 #include "defs.hpp"
 #include <random>
+#include <thread>
 
 constexpr int DEFAULT_W = 1280;
 constexpr int DEFAULT_H = 720;

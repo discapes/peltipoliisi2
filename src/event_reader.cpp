@@ -1,5 +1,6 @@
 #include <deque>
 #include <fstream>
+#include <thread>
 #include "defs.hpp"
 
 namespace {
