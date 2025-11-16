@@ -17,8 +17,10 @@ exe = executable(
   [
     'src/main.cpp',
     'src/event_reader.cpp',
-    'src/rpm_estimator.cpp',
-    'src/cluster_worker.cpp'
+    'src/rpm_from_fft.cpp',
+    'src/estimate_rpms.cpp',
+    'src/cluster_worker.cpp',
+    'src/render.cpp',
   ],
   install : true,
   dependencies : dependencies,
