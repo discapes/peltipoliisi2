@@ -31,15 +31,21 @@ vector<FrameState::ClusterOverlay> cluster_worker(
       int max_y = numeric_limits<int>::min();
       bool initialized = false;
     };
-    unordered_map<size_t, Bounds> aggregates;
+    struct ClusterInfo {
+      Bounds bounds;
+      vector<cv::Point> points;
+    };
+    unordered_map<size_t, ClusterInfo> aggregates;
     aggregates.reserve(point_count);
 
     for (size_t idx = 0; idx < point_count; ++idx) {
       const size_t label = assignments[idx];
       if (label == numeric_limits<size_t>::max()) continue;
-      Bounds &b = aggregates[label];
+      auto &cluster_info = aggregates[label];
       int px = static_cast<int>(coords[2 * idx]);
       int py = static_cast<int>(coords[2 * idx + 1]);
+      cluster_info.points.emplace_back(px, py);
+      auto &b = cluster_info.bounds;
       if (!b.initialized) {
         b.min_x = b.max_x = px;
         b.min_y = b.max_y = py;
@@ -52,10 +58,10 @@ vector<FrameState::ClusterOverlay> cluster_worker(
       }
     }
 
-    vector<pair<size_t, Bounds>> clusters;
+    vector<pair<size_t, ClusterInfo>> clusters;
     clusters.reserve(aggregates.size());
     for (auto &entry : aggregates) {
-      if (!entry.second.initialized) continue;
+      if (!entry.second.bounds.initialized) continue;
       clusters.emplace_back(entry.first, entry.second);
     }
     sort(clusters.begin(), clusters.end(),
@@ -68,7 +74,7 @@ vector<FrameState::ClusterOverlay> cluster_worker(
 
     overlays.reserve(clusters.size());
     for (size_t idx = 0; idx < clusters.size(); ++idx) {
-      const auto &b = clusters[idx].second;
+      const auto &b = clusters[idx].second.bounds;
       FrameState::ClusterOverlay overlay;
       overlay.box = cv::Rect(cv::Point(b.min_x, b.min_y),
                              cv::Point(b.max_x + 1, b.max_y + 1));
@@ -80,8 +86,17 @@ vector<FrameState::ClusterOverlay> cluster_worker(
       for (const auto &s : rpm_samples) {
         if (overlay.box.contains(cv::Point(s.x, s.y)) && isfinite(s.rpm) && s.rpm > 0.0) {
           rpms.push_back(s.rpm);
+
         }
       }
+      struct PointHash {
+        size_t operator()(const cv::Point &p) const {
+          return hash<int>()(p.x) ^ hash<int>()(p.y);
+        }
+      };
+      unordered_set<cv::Point, PointHash> cluster_pixels(
+          clusters[idx].second.points.begin(), clusters[idx].second.points.end());
+
       if (!rpms.empty()) {
         const size_t mid = rpms.size() / 2;
         nth_element(rpms.begin(), rpms.begin() + mid, rpms.end());

@@ -98,6 +98,7 @@ double estimate_rpm_from_events(const vector<FrameEvent> &events, int num_blades
     mag[k] = hypot(re, im);
   }
 
+
   auto band_mag = [&](int k) {
     double s = 0.0;
     if (k > 0) s += mag[k - 1];
@@ -119,6 +120,7 @@ double estimate_rpm_from_events(const vector<FrameEvent> &events, int num_blades
   }
 
   if (best_k < 0) {
+
     fftw_destroy_plan(plan);
     fftw_free(in);
     fftw_free(out);
@@ -147,6 +149,7 @@ double estimate_rpm_from_events(const vector<FrameEvent> &events, int num_blades
   }
 
   double best_freq = (static_cast<double>(chosen_k) * fs) / nbins;
+
 
   fftw_destroy_plan(plan);
   fftw_free(in);
