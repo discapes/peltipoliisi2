@@ -10,6 +10,17 @@ using namespace std;
 using u32 = uint32_t;
 using u64 = uint64_t;
 
+constexpr int DEFAULT_W = 1280;
+constexpr int DEFAULT_H = 720;
+constexpr int SLIDING_WINDOW_US = 50'000;
+constexpr int EVENT_COUNT_THRESHOLD = 10;
+constexpr double TARGET_FPS = 60.0;
+constexpr double CLUSTER_FPS = 60.0;
+constexpr int SAMPLE_POINTS = 200;
+constexpr int SAMPLE_RANGE = 1;
+constexpr int NUM_BLADES = 2;
+constexpr int CLUSTER_BOX_PADDING = 6;
+
 // Decoded event structure from 8-byte DAT record.
 // t: timestamp in microseconds
 // x, y: coordinates (14-bit each, stored in lower bits)
@@ -70,7 +81,9 @@ extern FrameState fs;
 // - events: vector of Event; only the timestamp field (t, in microseconds) is used
 // - num_blades: number of blades on the propeller (defaults to 2)
 // Returns NaN if not enough data or no clear peak.
-double estimate_rpm_from_events(const vector<FrameEvent> &events, int num_blades = 2);
+double rpm_from_fft(const vector<FrameEvent> &events, int num_blades = 2);
+
+FrameState::RpmStats estimate_rpms();
 
 struct DatHeaderInfo {
     int width=-1, height=-1, version=-1;
@@ -103,3 +116,5 @@ vector<FrameState::ClusterOverlay> cluster_worker(
   vector<RpmSample> rpm_samples,
   double cluster_eps,
   size_t cluster_min_points);
+
+bool render_frame();

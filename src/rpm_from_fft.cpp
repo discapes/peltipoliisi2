@@ -3,7 +3,7 @@
 #include <cmath>
 #include <algorithm>
 
-double estimate_rpm_from_events(const vector<FrameEvent> &events, int num_blades) {
+double rpm_from_fft(const vector<FrameEvent> &events, int num_blades) {
   const size_t N = events.size();
   if (N < 16) return numeric_limits<double>::quiet_NaN(); // not enough events
 
