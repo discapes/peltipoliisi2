@@ -29,7 +29,6 @@ void run_dat_reader(const string &dat_path) {
   // Uses default 50ms window; stream emits +1 on arrival and -1 on expiry.
   stream_dat_events(dat_path, event_pixel_callback, &header, SLIDING_WINDOW_US);
   fs.running.store(false);
-  fs.cluster_request_cv.notify_all();
 }
 
 void update_rotor_tracking(vector<FrameState::ClusterOverlay> &new_overlays) {

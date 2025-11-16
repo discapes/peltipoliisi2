@@ -48,12 +48,6 @@ struct FrameState {
   double cluster_eps{6.5};
   size_t cluster_min_points{12};
   // Background clustering communication
-  mutex cluster_request_mtx;
-  condition_variable cluster_request_cv;
-  vector<double> cluster_request_coords;
-  vector<FrameEvent> cluster_request_events;
-  u64 cluster_request_frame{0};
-  bool cluster_request_ready{false};
   mutex overlay_mtx;
   struct ClusterOverlay {
     cv::Rect box;
