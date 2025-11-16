@@ -15,6 +15,9 @@ using u64 = uint64_t;
 // polarity: 0 or 1
 struct FrameEvent { u32 t; uint16_t x; uint16_t y; uint8_t polarity; };
 
+// A precomputed RPM sample at location (x, y)
+struct RpmSample { int x; int y; double rpm; };
+
 struct FrameState {
   mutex mtx;
   cv::Mat frame; // BGR display buffer
@@ -28,6 +31,9 @@ struct FrameState {
     size_t valid = 0;
   };
   RpmStats rpm_stats{};
+  // Keep a short history of global RPM medians to smooth bursts.
+  vector<double> rpm_median_history;
+  size_t rpm_median_history_limit{7};
   double cluster_eps{6.5};
   size_t cluster_min_points{12};
   // Background clustering communication
@@ -78,6 +84,6 @@ bool stream_dat_events(const string &path,
 // Returns a list of overlays (bounding boxes, colors, optional RPM per cluster).
 vector<FrameState::ClusterOverlay> cluster_worker(
   vector<double> coords,
-  vector<FrameEvent> events,
+  vector<RpmSample> rpm_samples,
   double cluster_eps,
   size_t cluster_min_points);

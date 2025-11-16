@@ -1,5 +1,7 @@
 #include <fftw3.h>
 #include "defs.hpp"
+#include <cmath>
+#include <algorithm>
 
 double estimate_rpm_from_events(const vector<FrameEvent> &events, int num_blades) {
   const size_t N = events.size();
@@ -32,8 +34,15 @@ double estimate_rpm_from_events(const vector<FrameEvent> &events, int num_blades
   // Bin width: several times median inter-event gap, but not too small
   double bin_width = max(5.0 * median_dt, 1e-5); // >= 10 µs
 
+  // Choose a stable FFT size: round up to next power of two, with sane bounds.
   int nbins = static_cast<int>(ceil(T_total / bin_width));
-  if (nbins < 16) nbins = 16;
+  if (nbins < 64) nbins = 64;
+  // round up to next power-of-two
+  {
+    int p = 1;
+    while (p < nbins && p < 4096) p <<= 1;
+    nbins = p;
+  }
 
   // Allocate FFTW input/output
   double *in = (double*)fftw_malloc(sizeof(double) * nbins);
@@ -60,6 +69,15 @@ double estimate_rpm_from_events(const vector<FrameEvent> &events, int num_blades
   double mean = sum / nbins;
   for (int i = 0; i < nbins; ++i) in[i] -= mean;
 
+  // Apply Hann window to reduce spectral leakage
+  const double pi = 3.14159265358979323846;
+  if (nbins > 1) {
+    for (int i = 0; i < nbins; ++i) {
+      double w = 0.5 * (1.0 - cos(2.0 * pi * static_cast<double>(i) / static_cast<double>(nbins - 1)));
+      in[i] *= w;
+    }
+  }
+
   // Plan & execute FFT
   fftw_plan plan = fftw_plan_dft_r2c_1d(nbins, in, out, FFTW_ESTIMATE);
   fftw_execute(plan);
@@ -72,22 +90,63 @@ double estimate_rpm_from_events(const vector<FrameEvent> &events, int num_blades
   double f_min = 5.0;      // Hz
   double f_max = 5000.0;   // Hz
 
-  double best_mag = 0.0;
-  double best_freq = 0.0;
+  // Build magnitude spectrum and use a 3-bin neighborhood sum to score peaks
+  vector<double> mag(nfreq, 0.0);
+  for (int k = 0; k < nfreq; ++k) {
+    double re = out[k][0];
+    double im = out[k][1];
+    mag[k] = hypot(re, im);
+  }
 
+  auto band_mag = [&](int k) {
+    double s = 0.0;
+    if (k > 0) s += mag[k - 1];
+    s += mag[k];
+    if (k + 1 < nfreq) s += mag[k + 1];
+    return s;
+  };
+
+  double best_score = 0.0;
+  int best_k = -1;
   for (int k = 1; k < nfreq; ++k) {
     double f = (static_cast<double>(k) * fs) / nbins;
     if (f < f_min || f > f_max) continue;
-
-    double re = out[k][0];
-    double im = out[k][1];
-    double mag = hypot(re, im);
-
-    if (mag > best_mag) {
-      best_mag = mag;
-      best_freq = f;
+    double score = band_mag(k);
+    if (score > best_score) {
+      best_score = score;
+      best_k = k;
     }
   }
+
+  if (best_k < 0) {
+    fftw_destroy_plan(plan);
+    fftw_free(in);
+    fftw_free(out);
+    return numeric_limits<double>::quiet_NaN();
+  }
+
+  // Prefer a lower harmonic (fundamental) if it's close in energy
+  auto score_at = [&](int k) {
+    if (k <= 0 || k >= nfreq) return 0.0;
+    double f = (static_cast<double>(k) * fs) / nbins;
+    if (f < f_min || f > f_max) return 0.0;
+    return band_mag(k);
+  };
+
+  const double harmonic_bias_ratio = 0.6; // within ~ -4.4 dB
+  int chosen_k = best_k;
+  int half_k = static_cast<int>(llround(best_k / 2.0));
+  int third_k = static_cast<int>(llround(best_k / 3.0));
+  double best_s = band_mag(best_k);
+  double s_half = score_at(half_k);
+  double s_third = score_at(third_k);
+  if (s_half >= harmonic_bias_ratio * best_s) {
+    chosen_k = half_k;
+  } else if (s_third >= harmonic_bias_ratio * best_s) {
+    chosen_k = third_k;
+  }
+
+  double best_freq = (static_cast<double>(chosen_k) * fs) / nbins;
 
   fftw_destroy_plan(plan);
   fftw_free(in);

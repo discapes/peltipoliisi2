@@ -10,10 +10,10 @@
 // Refactored cluster_worker: compute overlays from given coords/events and parameters.
 // Returns overlays; does not access or modify global FrameState.
 vector<FrameState::ClusterOverlay> cluster_worker(
-    vector<double> coords,
-    vector<FrameEvent> events,
-    double cluster_eps,
-    size_t cluster_min_points) {
+  vector<double> coords,
+  vector<RpmSample> rpm_samples,
+  double cluster_eps,
+  size_t cluster_min_points) {
   vector<FrameState::ClusterOverlay> overlays;
   const size_t point_count = coords.size() / 2;
   if (point_count < cluster_min_points) return overlays;
@@ -74,16 +74,24 @@ vector<FrameState::ClusterOverlay> cluster_worker(
                              cv::Point(b.max_x + 1, b.max_y + 1));
       overlay.color = palette[idx % palette.size()];
 
-      vector<FrameEvent> local;
-      local.reserve(128);
-      for (const auto &ev : events) {
-        if (overlay.box.contains(cv::Point(ev.x, ev.y))) {
-          local.push_back(ev);
+      // Gather precomputed RPMs whose sample location lies inside the cluster box
+      vector<double> rpms;
+      rpms.reserve(32);
+      for (const auto &s : rpm_samples) {
+        if (overlay.box.contains(cv::Point(s.x, s.y)) && isfinite(s.rpm) && s.rpm > 0.0) {
+          rpms.push_back(s.rpm);
         }
       }
-      if (local.size() >= 16) {
-        double rpm = estimate_rpm_from_events(local);
-        if (isfinite(rpm) && rpm > 0.0) overlay.rpm = rpm;
+      if (!rpms.empty()) {
+        const size_t mid = rpms.size() / 2;
+        nth_element(rpms.begin(), rpms.begin() + mid, rpms.end());
+        if (rpms.size() % 2 == 1) {
+          overlay.rpm = rpms[mid];
+        } else {
+          double a = *max_element(rpms.begin(), rpms.begin() + mid);
+          double b = rpms[mid];
+          overlay.rpm = 0.5 * (a + b);
+        }
       }
       overlays.push_back(move(overlay));
     }
