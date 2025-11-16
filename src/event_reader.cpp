@@ -3,6 +3,10 @@
 #include <thread>
 #include "defs.hpp"
 
+// Shared active-event deque (events within the sliding window), protected by a mutex.
+static std::deque<FrameEvent> g_active;
+static std::mutex g_active_mtx;
+
 namespace {
 #pragma pack(push,1)
 struct RawRecord { u32 t32; u32 w32; }; // 8-byte raw event
@@ -89,7 +93,7 @@ bool stream_dat_events(const string &path,
     // We'll stream one event at a time and interleave expirations.
     // Since events are time-ordered, expirations (t + window) are also time-ordered.
     // Maintain a FIFO deque of active events; the front is the next to expire.
-    deque<FrameEvent> active;
+    // This is shared via g_active so other threads can snapshot it.
 
     // Realtime pacing anchors
     chrono::steady_clock::time_point wall_base;
@@ -114,10 +118,14 @@ bool stream_dat_events(const string &path,
         ts_base = next_ev.t;
     }
 
-    while (has_next_ev || !active.empty()) {
+    while (has_next_ev || !g_active.empty()) {
         // Determine next arrival and next expiry timestamps
         u32 next_arrival_ts = has_next_ev ? next_ev.t : numeric_limits<u32>::max();
-        u32 next_expiry_ts = !active.empty() ? static_cast<u32>(active.front().t + window_us) : numeric_limits<u32>::max();
+        u32 next_expiry_ts;
+        {
+            lock_guard<mutex> lk(g_active_mtx);
+            next_expiry_ts = !g_active.empty() ? static_cast<u32>(g_active.front().t + window_us) : numeric_limits<u32>::max();
+        }
         bool do_expiry = next_expiry_ts <= next_arrival_ts;
 
         u32 schedule_ts = do_expiry ? next_expiry_ts : next_arrival_ts;
@@ -129,11 +137,21 @@ bool stream_dat_events(const string &path,
 
         if (do_expiry) {
             // Expire all events whose expiry time <= schedule_ts
-            while (!active.empty()) {
-                u32 exp_ts = static_cast<u32>(active.front().t + window_us);
-                if (exp_ts <= schedule_ts) {
-                    FrameEvent ev = active.front();
-                    active.pop_front();
+            while (true) {
+                FrameEvent ev;
+                bool have = false;
+                {
+                    lock_guard<mutex> lk(g_active_mtx);
+                    if (!g_active.empty()) {
+                        u32 exp_ts = static_cast<u32>(g_active.front().t + window_us);
+                        if (exp_ts <= schedule_ts) {
+                            ev = g_active.front();
+                            g_active.pop_front();
+                            have = true;
+                        }
+                    }
+                }
+                if (have) {
                     if (callback) callback(ev, -1);
                 } else {
                     break;
@@ -143,7 +161,10 @@ bool stream_dat_events(const string &path,
             // Emit arrival (+1)
             if (callback) callback(next_ev, +1);
             // Track active event for future expiry
-            active.push_back(next_ev);
+            {
+                lock_guard<mutex> lk(g_active_mtx);
+                g_active.push_back(next_ev);
+            }
 
             // Load next event from file
             ifs.read(reinterpret_cast<char*>(&rr), sizeof(rr));
@@ -163,4 +184,9 @@ bool stream_dat_events(const string &path,
     }
 
     return true;
+}
+
+void snapshot_active_events(vector<FrameEvent> &out) {
+    lock_guard<mutex> lk(g_active_mtx);
+    out.assign(g_active.begin(), g_active.end());
 }

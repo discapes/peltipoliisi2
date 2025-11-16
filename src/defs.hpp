@@ -4,6 +4,7 @@
 #include <condition_variable>
 #include <vector>
 #include <opencv2/opencv.hpp>
+#include <deque>
 using namespace std;
 
 using u32 = uint32_t;
@@ -23,7 +24,6 @@ struct FrameState {
   cv::Mat frame; // BGR display buffer
   cv::Mat counts; // CV_32SC1 per-pixel event counters
   // Events collected in the current frame (reset each render)
-  vector<FrameEvent> frame_events;
   atomic<bool> running{true};
   struct RpmStats {
     double median = numeric_limits<double>::quiet_NaN();
@@ -88,6 +88,10 @@ bool stream_dat_events(const string &path,
                        const function<void(const FrameEvent &, int delta)> &callback,
                        DatHeaderInfo *out_header=nullptr,
                        u32 window_us = 50'000);
+
+// Snapshot the current deque of active events (those within the sliding window)
+// maintained by the event reader. Thread-safe copy.
+void snapshot_active_events(vector<FrameEvent> &out);
 
 // Compute clusters and overlays from sampled coords and events.
 // - coords: packed [x0, y0, x1, y1, ...]

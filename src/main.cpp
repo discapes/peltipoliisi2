@@ -9,7 +9,7 @@ constexpr int CLUSTER_BOX_PADDING = 6;
 constexpr int SLIDING_WINDOW_US = 50'000;
 constexpr int EVENT_COUNT_THRESHOLD = 10;
 constexpr double TARGET_FPS = 60.0;
-constexpr double CLUSTER_FPS = 20.0;
+constexpr double CLUSTER_FPS = 60.0;
 constexpr int SAMPLE_POINTS = 200;
 constexpr int SAMPLE_RANGE = 1;
 constexpr int NUM_BLADES = 2;
@@ -25,8 +25,7 @@ inline void event_pixel_callback(const FrameEvent &e, int delta) {
   int &cnt = fs.counts.at<int>(e.y, e.x);
   if (delta > 0) {
     if (cnt < INT32_MAX) ++cnt;
-    // Store timestamp and location for this frame (only arrivals)
-    fs.frame_events.push_back(FrameEvent{e.t, e.x, e.y, e.polarity});
+  // No longer storing per-event copies; we'll snapshot the active deque instead.
   } else if (delta < 0) {
     if (cnt > 0) --cnt; // clamp at 0
   }
@@ -83,10 +82,9 @@ FrameState::RpmStats compute_rpm_stats_from_counts() {
         }
       }
     }
-    // Snapshot events then clear for next interval.
-    events_snapshot = fs.frame_events;
-    fs.frame_events.clear();
+    // Snapshot events from the reader's active deque (windowed events)
   }
+  snapshot_active_events(events_snapshot);
   frame_id_for_workers = 0; //fs.frame_index.load(memory_order_relaxed);
 
   stats.sampled = sample_points.size();
