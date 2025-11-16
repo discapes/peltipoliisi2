@@ -10,47 +10,57 @@
 // Refactored cluster_worker: compute overlays from given coords/events and parameters.
 // Returns overlays; does not access or modify global FrameState.
 vector<FrameState::ClusterOverlay> cluster_worker(
-  vector<double> coords,
-  vector<RpmSample> rpm_samples,
-  double cluster_eps,
-  size_t cluster_min_points) {
+    vector<double> coords,
+    vector<RpmSample> rpm_samples,
+    double cluster_eps,
+    size_t cluster_min_points)
+{
   vector<FrameState::ClusterOverlay> overlays;
   const size_t point_count = coords.size() / 2;
-  if (point_count < cluster_min_points) return overlays;
+  if (point_count < cluster_min_points)
+    return overlays;
 
-  try {
+  try
+  {
     arma::mat data(coords.data(), 2, point_count, false, true);
     mlpack::DBSCAN<> clusterer(cluster_eps, cluster_min_points);
     arma::Row<size_t> assignments;
     clusterer.Cluster(data, assignments);
 
-    struct Bounds {
+    struct Bounds
+    {
       int min_x = numeric_limits<int>::max();
       int min_y = numeric_limits<int>::max();
       int max_x = numeric_limits<int>::min();
       int max_y = numeric_limits<int>::min();
       bool initialized = false;
     };
-    struct ClusterInfo {
+    struct ClusterInfo
+    {
       Bounds bounds;
       vector<cv::Point> points;
     };
     unordered_map<size_t, ClusterInfo> aggregates;
     aggregates.reserve(point_count);
 
-    for (size_t idx = 0; idx < point_count; ++idx) {
+    for (size_t idx = 0; idx < point_count; ++idx)
+    {
       const size_t label = assignments[idx];
-      if (label == numeric_limits<size_t>::max()) continue;
+      if (label == numeric_limits<size_t>::max())
+        continue;
       auto &cluster_info = aggregates[label];
       int px = static_cast<int>(coords[2 * idx]);
       int py = static_cast<int>(coords[2 * idx + 1]);
       cluster_info.points.emplace_back(px, py);
       auto &b = cluster_info.bounds;
-      if (!b.initialized) {
+      if (!b.initialized)
+      {
         b.min_x = b.max_x = px;
         b.min_y = b.max_y = py;
         b.initialized = true;
-      } else {
+      }
+      else
+      {
         b.min_x = min(b.min_x, px);
         b.min_y = min(b.min_y, py);
         b.max_x = max(b.max_x, px);
@@ -60,20 +70,24 @@ vector<FrameState::ClusterOverlay> cluster_worker(
 
     vector<pair<size_t, ClusterInfo>> clusters;
     clusters.reserve(aggregates.size());
-    for (auto &entry : aggregates) {
-      if (!entry.second.bounds.initialized) continue;
+    for (auto &entry : aggregates)
+    {
+      if (!entry.second.bounds.initialized)
+        continue;
       clusters.emplace_back(entry.first, entry.second);
     }
     sort(clusters.begin(), clusters.end(),
-         [](const auto &a, const auto &b) { return a.first < b.first; });
+         [](const auto &a, const auto &b)
+         { return a.first < b.first; });
 
     static const array<cv::Scalar, 8> palette = {
-        cv::Scalar(0, 0, 255),  cv::Scalar(0, 255, 0),   cv::Scalar(255, 0, 0),
+        cv::Scalar(0, 0, 255), cv::Scalar(0, 255, 0), cv::Scalar(255, 0, 0),
         cv::Scalar(0, 255, 255), cv::Scalar(255, 0, 255), cv::Scalar(255, 255, 0),
         cv::Scalar(128, 255, 0), cv::Scalar(0, 128, 255)};
 
     overlays.reserve(clusters.size());
-    for (size_t idx = 0; idx < clusters.size(); ++idx) {
+    for (size_t idx = 0; idx < clusters.size(); ++idx)
+    {
       const auto &b = clusters[idx].second.bounds;
       FrameState::ClusterOverlay overlay;
       overlay.box = cv::Rect(cv::Point(b.min_x, b.min_y),
@@ -83,26 +97,33 @@ vector<FrameState::ClusterOverlay> cluster_worker(
       // Gather precomputed RPMs whose sample location lies inside the cluster box
       vector<double> rpms;
       rpms.reserve(32);
-      for (const auto &s : rpm_samples) {
-        if (overlay.box.contains(cv::Point(s.x, s.y)) && isfinite(s.rpm) && s.rpm > 0.0) {
+      for (const auto &s : rpm_samples)
+      {
+        if (overlay.box.contains(cv::Point(s.x, s.y)) && isfinite(s.rpm) && s.rpm > 0.0)
+        {
           rpms.push_back(s.rpm);
-
         }
       }
-      struct PointHash {
-        size_t operator()(const cv::Point &p) const {
+      struct PointHash
+      {
+        size_t operator()(const cv::Point &p) const
+        {
           return hash<int>()(p.x) ^ hash<int>()(p.y);
         }
       };
       unordered_set<cv::Point, PointHash> cluster_pixels(
           clusters[idx].second.points.begin(), clusters[idx].second.points.end());
 
-      if (!rpms.empty()) {
+      if (!rpms.empty())
+      {
         const size_t mid = rpms.size() / 2;
         nth_element(rpms.begin(), rpms.begin() + mid, rpms.end());
-        if (rpms.size() % 2 == 1) {
+        if (rpms.size() % 2 == 1)
+        {
           overlay.rpm = rpms[mid];
-        } else {
+        }
+        else
+        {
           double a = *max_element(rpms.begin(), rpms.begin() + mid);
           double b = rpms[mid];
           overlay.rpm = 0.5 * (a + b);
@@ -110,7 +131,9 @@ vector<FrameState::ClusterOverlay> cluster_worker(
       }
       overlays.push_back(move(overlay));
     }
-  } catch (const exception &ex) {
+  }
+  catch (const exception &ex)
+  {
     cerr << "[cluster-worker] DBSCAN failed: " << ex.what() << endl;
   }
 

@@ -45,8 +45,7 @@ struct RpmSample
 struct FrameState
 {
   mutex mtx;
-  cv::Mat counts; // CV_32SC1 per-pixel event counters
-  // Events collected in the current frame (reset each render)
+  cv::Mat counts;
   atomic<bool> running{true};
   struct RpmStats
   {
