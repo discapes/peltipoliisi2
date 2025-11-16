@@ -1,0 +1,21 @@
+[project]
+name = "fred-trainer"
+version = "0.1.0"
+description = "Minimal trajectory predictor trainer for the FRED dataset."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "torch>=2.2",
+]
+
+[project.scripts]
+train-fred-predictor = "train_fred_predictor:main"
+
+[tool.setuptools]
+py-modules = ["train_fred_predictor", "evaluate_fred_predictor"]
+
+[tool.uv]
+package = true
+
+

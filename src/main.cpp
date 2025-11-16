@@ -1,6 +1,8 @@
 // Event visualizer (30 FPS) – color white when a pixel sees >= threshold events.
 #include "defs.hpp"
-#include <random>
+#include <array>
+#include <cstdlib>
+#include <optional>
 #include <thread>
 
 FrameState fs{
@@ -21,6 +23,38 @@ void run_dat_reader(const string &dat_path)
   // Uses default 50ms window; stream emits +1 on arrival and -1 on expiry.
   stream_dat_events(dat_path, event_pixel_callback, &header, SLIDING_WINDOW_US, fs.running);
   fs.running.store(false);
+}
+
+optional<cv::Point2f> compute_rotor_centroid(const vector<FrameState::TrackedRotor> &rotors)
+{
+  if (rotors.empty())
+    return nullopt;
+
+  cv::Point2d weighted_sum(0.0, 0.0);
+  double weight_sum = 0.0;
+
+  for (const auto &rotor : rotors)
+  {
+    const cv::Point2d center(rotor.box.x + rotor.box.width * 0.5,
+                             rotor.box.y + rotor.box.height * 0.5);
+
+    double weight = 1.0;
+    if (!rotor.rpm_history.empty())
+    {
+      const double rpm = rotor.rpm_history.back();
+      if (isfinite(rpm) && rpm > 0.0)
+        weight = rpm;
+    }
+
+    weighted_sum += center * weight;
+    weight_sum += weight;
+  }
+
+  if (weight_sum <= 0.0)
+    weight_sum = static_cast<double>(rotors.size());
+
+  const cv::Point2d avg = weighted_sum / weight_sum;
+  return cv::Point2f(static_cast<float>(avg.x), static_cast<float>(avg.y));
 }
 
 void update_rotor_tracking(vector<FrameState::ClusterOverlay> &new_overlays)
@@ -120,18 +154,57 @@ void rpm_counter_loop()
     }
     update_rotor_tracking(overlays_copy);
 
+    vector<FrameState::TrackedRotor> tracked_snapshot;
+    {
+      lock_guard<mutex> lk(fs.mtx);
+      tracked_snapshot = fs.tracked_rotors;
+    }
+
+    if (auto centroid = compute_rotor_centroid(tracked_snapshot))
+    {
+      g_trajectory_predictor.add_observation(*centroid);
+    }
+
     this_thread::sleep_until(next_frame);
   }
 }
 
 int main(int argc, char **argv)
 {
-  if (argc != 2)
+  if (argc < 2 || argc > 3)
   {
-    cout << "Usage: " << argv[0] << " <DAT filepath>\n";
+    cout << "Usage: " << argv[0] << " <DAT filepath> [trajectory_model.ts]\n";
     return 1;
   }
+
   string dat_path = argv[1];
+  string model_path;
+  if (argc == 3)
+  {
+    model_path = argv[2];
+  }
+  else if (const char *env = std::getenv("TRAJECTORY_MODEL"))
+  {
+    model_path = env;
+  }
+  else
+  {
+    model_path = "artifacts/trajectory_gru.ts";
+  }
+
+  if (!model_path.empty())
+  {
+    TrajectoryPredictorConfig cfg;
+    cfg.model_path = model_path;
+    cfg.image_width = static_cast<float>(fs.counts.cols);
+    cfg.image_height = static_cast<float>(fs.counts.rows);
+    string error_msg;
+    if (!g_trajectory_predictor.load(cfg, &error_msg))
+    {
+      if (!error_msg.empty())
+        cerr << "Trajectory predictor disabled: " << error_msg << endl;
+    }
+  }
 
   thread reader(run_dat_reader, dat_path);
   thread rpm_counter(rpm_counter_loop);

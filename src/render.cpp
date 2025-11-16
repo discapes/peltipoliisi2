@@ -1,24 +1,51 @@
 #include "defs.hpp"
 #include <chrono>
+#include <cmath>
+#include <optional>
+#include <thread>
+
+namespace
+{
+void draw_text_line(cv::Mat &display,
+                    int &cursor_y,
+                    const std::string &line,
+                    const cv::Scalar &text_color = cv::Scalar(0, 255, 255),
+                    const cv::Scalar *marker = nullptr)
+{
+  if (marker)
+  {
+    cv::rectangle(display,
+                  cv::Point(10, cursor_y - 12),
+                  cv::Point(22, cursor_y - 2),
+                  *marker, cv::FILLED);
+    cv::putText(display, line, cv::Point(26, cursor_y),
+                cv::FONT_HERSHEY_SIMPLEX, 0.5,
+                text_color, 1, cv::LINE_AA);
+  }
+  else
+  {
+    cv::putText(display, line, cv::Point(10, cursor_y),
+                cv::FONT_HERSHEY_SIMPLEX, 0.55,
+                text_color, 1, cv::LINE_AA);
+  }
+  cursor_y += 18;
+}
+}
 
 void render_frame(cv::Mat &frame)
 {
   cv::Mat display;
-  cv::Mat counts_snapshot;
   FrameState::RpmStats rpm_stats_copy;
-  vector<FrameState::TrackedRotor> tracked_rotors_copy;
+  std::vector<FrameState::TrackedRotor> tracked_rotors_copy;
 
-  // Prepare display buffer
   display.create(frame.rows, frame.cols, CV_8UC3);
   display.setTo(cv::Scalar(0, 0, 0));
 
-  // Build mask where counts >= threshold and set those pixels to white.
   cv::Mat mask;
-  cv::compare(fs.counts, EVENT_COUNT_THRESHOLD, mask, cv::CMP_GE); // mask: 255 where true
+  cv::compare(fs.counts, EVENT_COUNT_THRESHOLD, mask, cv::CMP_GE);
   display.setTo(cv::Scalar(255, 255, 255), mask);
-  rpm_stats_copy = fs.rpm_stats; // snapshot under lock
+  rpm_stats_copy = fs.rpm_stats;
 
-  // Snapshot tracked rotors for rendering
   tracked_rotors_copy = fs.tracked_rotors;
 
   for (const auto &rotor : tracked_rotors_copy)
@@ -33,61 +60,117 @@ void render_frame(cv::Mat &frame)
     cv::rectangle(display, padded, rotor.color, 2);
   }
 
-  int rpm_block_y = 45;
-  auto put_line = [&](const string &line,
-                      const cv::Scalar &text_color = cv::Scalar(0, 255, 255),
-                      const cv::Scalar *marker = nullptr)
+  auto to_int_points = [](const std::vector<cv::Point2f> &src)
   {
-    if (marker)
+    std::vector<cv::Point> dst;
+    dst.reserve(src.size());
+    for (const auto &pt : src)
     {
-      cv::rectangle(display,
-                    cv::Point(10, rpm_block_y - 12),
-                    cv::Point(22, rpm_block_y - 2),
-                    *marker, cv::FILLED);
-      cv::putText(display, line, cv::Point(26, rpm_block_y),
-                  cv::FONT_HERSHEY_SIMPLEX, 0.5,
-                  text_color, 1, cv::LINE_AA);
+      dst.emplace_back(cvRound(pt.x), cvRound(pt.y));
     }
-    else
-    {
-      cv::putText(display, line, cv::Point(10, rpm_block_y),
-                  cv::FONT_HERSHEY_SIMPLEX, 0.55,
-                  text_color, 1, cv::LINE_AA);
-    }
-    rpm_block_y += 18;
+    return dst;
   };
 
-  if (!isfinite(rpm_stats_copy.median) || rpm_stats_copy.median <= 0.0)
+  auto observed_trace = to_int_points(g_trajectory_predictor.observation_trace_pixels());
+  optional<cv::Point> last_observed;
+  if (observed_trace.size() >= 2)
   {
-    put_line("Global RPM: N/A");
+    cv::polylines(display, observed_trace, false, cv::Scalar(0, 165, 255), 2, cv::LINE_AA);
+  }
+  if (!observed_trace.empty())
+  {
+    last_observed = observed_trace.back();
+  }
+  std::optional<cv::Point2f> avg_prediction_delta;
+  auto predicted_trace = to_int_points(g_trajectory_predictor.latest_prediction_pixels());
+  if (!predicted_trace.empty())
+  {
+    vector<cv::Point> prediction_path = predicted_trace;
+    if (last_observed)
+    {
+      prediction_path.insert(prediction_path.begin(), *last_observed);
+    }
+    if (prediction_path.size() >= 2)
+    {
+      cv::polylines(display, prediction_path, false, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+      if (last_observed)
+      {
+        cv::arrowedLine(display, *last_observed, prediction_path.back(),
+                        cv::Scalar(0, 255, 0), 2, cv::LINE_AA, 0, 0.25);
+      }
+    }
+    for (const auto &pt : predicted_trace)
+    {
+      cv::circle(display, pt, 4, cv::Scalar(0, 255, 0), cv::FILLED);
+    }
+
+    const float vis_scale = 3.0f;
+    const cv::Point2f base = last_observed ? cv::Point2f(static_cast<float>(last_observed->x),
+                                                        static_cast<float>(last_observed->y))
+                                           : cv::Point2f(static_cast<float>(prediction_path.front().x),
+                                                         static_cast<float>(prediction_path.front().y));
+    vector<cv::Point> exaggerated;
+    exaggerated.reserve(predicted_trace.size());
+    cv::Point2f avg_delta(0.0f, 0.0f);
+    for (const auto &pt : predicted_trace)
+    {
+      cv::Point2f delta(static_cast<float>(pt.x) - base.x,
+                        static_cast<float>(pt.y) - base.y);
+      avg_delta += delta;
+      cv::Point2f scaled = base + delta * vis_scale;
+      int sx = std::clamp(static_cast<int>(std::round(scaled.x)), 0, display.cols - 1);
+      int sy = std::clamp(static_cast<int>(std::round(scaled.y)), 0, display.rows - 1);
+      exaggerated.emplace_back(sx, sy);
+    }
+    if (!exaggerated.empty())
+    {
+      cv::polylines(display, exaggerated, false, cv::Scalar(64, 255, 64), 1, cv::LINE_AA);
+      for (const auto &pt : exaggerated)
+      {
+        cv::circle(display, pt, 2, cv::Scalar(64, 255, 64), cv::FILLED);
+      }
+    }
+
+    if (!predicted_trace.empty())
+    {
+      avg_delta *= (1.0f / static_cast<float>(predicted_trace.size()));
+      avg_prediction_delta = avg_delta;
+    }
+  }
+
+  int rpm_block_y = 45;
+
+  if (!std::isfinite(rpm_stats_copy.median) || rpm_stats_copy.median <= 0.0)
+  {
+    draw_text_line(display, rpm_block_y, "Global RPM: N/A");
   }
   else
   {
-    put_line("Global RPM: " + to_string(static_cast<int>(round(rpm_stats_copy.median))) +
-             " (" + to_string(rpm_stats_copy.sampled) + " samples)");
+    draw_text_line(display, rpm_block_y,
+                   "Global RPM: " + std::to_string(static_cast<int>(std::round(rpm_stats_copy.median))) +
+                       " (" + std::to_string(rpm_stats_copy.sampled) + " samples)");
   }
 
   if (tracked_rotors_copy.empty())
   {
-    put_line("Clusters: none");
+    draw_text_line(display, rpm_block_y, "Clusters: none");
   }
   else
   {
-    put_line("Clusters:");
+    draw_text_line(display, rpm_block_y, "Clusters:");
     for (const auto &rotor : tracked_rotors_copy)
     {
-      string line = "#" + to_string(rotor.id) + ": ";
-      if (!rotor.rpm_history.empty() && isfinite(rotor.rpm_history.back()))
+      std::string line = "#" + std::to_string(rotor.id) + ": ";
+      if (!rotor.rpm_history.empty() && std::isfinite(rotor.rpm_history.back()))
       {
-        line += to_string(static_cast<int>(round(rotor.rpm_history.back()))) + " RPM";
+        line += std::to_string(static_cast<int>(std::round(rotor.rpm_history.back()))) + " RPM";
       }
       else
       {
         line += "RPM N/A";
       }
-      put_line(line, rotor.color, &rotor.color);
+      draw_text_line(display, rpm_block_y, line, rotor.color, &rotor.color);
 
-      // Draw RPM history graph in sidebar
       if (rotor.rpm_history.size() > 1)
       {
         int graph_w = 150;
@@ -98,47 +181,60 @@ void render_frame(cv::Mat &frame)
         cv::Rect graph_rect(graph_origin, cv::Size(graph_w, graph_h));
         cv::rectangle(display, graph_rect, cv::Scalar(100, 100, 100), 1);
 
-        // Find min/max RPM in history for scaling
         double min_rpm = 0;
         double max_rpm = 0;
-
         for (double rpm : rotor.rpm_history)
         {
           if (rpm > max_rpm)
             max_rpm = rpm;
         }
-
-        max_rpm *= 1.5; // Add 20% padding
-
+        max_rpm *= 1.5;
         double rpm_range = max_rpm - min_rpm;
         if (rpm_range < 500)
           rpm_range = 500;
 
-        vector<cv::Point> points;
+        std::vector<cv::Point> points;
         points.reserve(rotor.rpm_history.size());
         for (size_t i = 0; i < rotor.rpm_history.size(); ++i)
         {
-          int x = graph_origin.x + (int)((double)i / (fs.RPM_HISTORY_SIZE - 1) * graph_w);
-          int y = graph_origin.y + graph_h - (int)(((rotor.rpm_history[i] - min_rpm) / max_rpm) * graph_h);
+          int x = graph_origin.x + static_cast<int>((double)i / (FrameState::RPM_HISTORY_SIZE - 1) * graph_w);
+          int y = graph_origin.y + graph_h - static_cast<int>(((rotor.rpm_history[i] - min_rpm) / max_rpm) * graph_h);
           points.emplace_back(x, y);
         }
         cv::polylines(display, points, false, rotor.color, 1, cv::LINE_AA);
 
-        // Y-axis label and ticks
         cv::putText(display, "RPM", cv::Point(graph_origin.x, graph_origin.y - 5),
                     cv::FONT_HERSHEY_SIMPLEX, 0.3, cv::Scalar(200, 200, 200), 1, cv::LINE_AA);
-        cv::putText(display, to_string((int)max_rpm), cv::Point(graph_rect.br().x + text_margin, graph_origin.y + 10),
+        cv::putText(display, std::to_string(static_cast<int>(max_rpm)),
+                    cv::Point(graph_rect.br().x + text_margin, graph_origin.y + 10),
                     cv::FONT_HERSHEY_SIMPLEX, 0.3, cv::Scalar(200, 200, 200), 1, cv::LINE_AA);
-        cv::putText(display, to_string((int)min_rpm), cv::Point(graph_rect.br().x + text_margin, graph_origin.y + graph_h),
+        cv::putText(display, std::to_string(static_cast<int>(min_rpm)),
+                    cv::Point(graph_rect.br().x + text_margin, graph_origin.y + graph_h),
                     cv::FONT_HERSHEY_SIMPLEX, 0.3, cv::Scalar(200, 200, 200), 1, cv::LINE_AA);
 
-        // X-axis label
-        cv::putText(display, "Time", cv::Point(graph_origin.x + graph_w / 2 - 10, graph_rect.br().y + 12),
+        cv::putText(display, "Time",
+                    cv::Point(graph_origin.x + graph_w / 2 - 10, graph_rect.br().y + 12),
                     cv::FONT_HERSHEY_SIMPLEX, 0.3, cv::Scalar(200, 200, 200), 1, cv::LINE_AA);
 
         rpm_block_y += graph_h + 30;
       }
     }
+  }
+
+  if (!predicted_trace.empty())
+  {
+    draw_text_line(display, rpm_block_y,
+                   "Trajectory horizon: +" + std::to_string(predicted_trace.size()) + " steps");
+    if (avg_prediction_delta)
+    {
+      draw_text_line(display, rpm_block_y,
+                     "Δx=" + std::to_string(static_cast<int>(avg_prediction_delta->x)) +
+                         " px   Δy=" + std::to_string(static_cast<int>(avg_prediction_delta->y)) + " px");
+    }
+  }
+  else if (!observed_trace.empty())
+  {
+    draw_text_line(display, rpm_block_y, "Trajectory horizon: collecting context");
   }
 
   cv::imshow("Events", display);

@@ -1,0 +1,9 @@
+evaluate_fred_predictor.py
+pyproject.toml
+train_fred_predictor.py
+fred_trainer.egg-info/PKG-INFO
+fred_trainer.egg-info/SOURCES.txt
+fred_trainer.egg-info/dependency_links.txt
+fred_trainer.egg-info/entry_points.txt
+fred_trainer.egg-info/requires.txt
+fred_trainer.egg-info/top_level.txt

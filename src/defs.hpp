@@ -1,10 +1,11 @@
 // Event visualizer (30 FPS) – color white when a pixel sees >= threshold events.
 #include <cstdint>
 #include <mutex>
-#include <condition_variable>
 #include <vector>
 #include <opencv2/opencv.hpp>
+#include <torch/script.h>
 #include <deque>
+
 using namespace std;
 using steady = chrono::steady_clock;
 
@@ -128,3 +129,42 @@ vector<FrameState::ClusterOverlay> cluster_worker(
     size_t cluster_min_points);
 
 void render_thread_loop();
+
+
+struct TrajectoryPredictorConfig
+{
+  std::string model_path;
+  int input_len = 20;
+  int pred_len = 10;
+  float image_width = static_cast<float>(DEFAULT_W);
+  float image_height = static_cast<float>(DEFAULT_H);
+};
+
+class TrajectoryPredictor
+{
+public:
+  bool load(const TrajectoryPredictorConfig &cfg, std::string *error_msg = nullptr);
+  void reset();
+  void add_observation(const cv::Point2f &pixel);
+
+  std::vector<cv::Point2f> latest_prediction_pixels() const;
+  std::vector<cv::Point2f> observation_trace_pixels() const;
+  bool ready() const;
+  int pred_len() const;
+
+private:
+  void run_inference_locked();
+
+  mutable std::mutex mtx_;
+  bool loaded_{false};
+  int input_len_{0};
+  int pred_len_{0};
+  float image_width_{static_cast<float>(DEFAULT_W)};
+  float image_height_{static_cast<float>(DEFAULT_H)};
+  std::deque<cv::Point2f> history_norm_;
+  std::deque<cv::Point2f> history_pixels_;
+  std::vector<cv::Point2f> last_prediction_pixels_;
+  torch::jit::script::Module module_;
+};
+
+extern TrajectoryPredictor g_trajectory_predictor;
