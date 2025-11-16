@@ -6,6 +6,7 @@
 #include <opencv2/opencv.hpp>
 #include <deque>
 using namespace std;
+using steady = chrono::steady_clock;
 
 using u32 = uint32_t;
 using u64 = uint64_t;
@@ -25,18 +26,30 @@ constexpr int CLUSTER_BOX_PADDING = 6;
 // t: timestamp in microseconds
 // x, y: coordinates (14-bit each, stored in lower bits)
 // polarity: 0 or 1
-struct FrameEvent { u32 t; uint16_t x; uint16_t y; uint8_t polarity; };
+struct FrameEvent
+{
+  u32 t;
+  uint16_t x;
+  uint16_t y;
+  uint8_t polarity;
+};
 
 // A precomputed RPM sample at location (x, y)
-struct RpmSample { int x; int y; double rpm; };
+struct RpmSample
+{
+  int x;
+  int y;
+  double rpm;
+};
 
-struct FrameState {
+struct FrameState
+{
   mutex mtx;
-  cv::Mat frame; // BGR display buffer
   cv::Mat counts; // CV_32SC1 per-pixel event counters
   // Events collected in the current frame (reset each render)
   atomic<bool> running{true};
-  struct RpmStats {
+  struct RpmStats
+  {
     double median = numeric_limits<double>::quiet_NaN();
     size_t sampled = 0;
     size_t valid = 0;
@@ -49,7 +62,8 @@ struct FrameState {
   size_t cluster_min_points{12};
   // Background clustering communication
   mutex overlay_mtx;
-  struct ClusterOverlay {
+  struct ClusterOverlay
+  {
     cv::Rect box;
     double rpm = numeric_limits<double>::quiet_NaN();
     cv::Scalar color{0, 0, 255};
@@ -58,7 +72,8 @@ struct FrameState {
   u64 overlay_frame{0};
 
   // Rotor tracking
-  struct TrackedRotor {
+  struct TrackedRotor
+  {
     int id;
     cv::Rect box;
     cv::Scalar color;
@@ -79,10 +94,11 @@ double rpm_from_fft(const vector<FrameEvent> &events, int num_blades = 2);
 
 FrameState::RpmStats estimate_rpms();
 
-struct DatHeaderInfo {
-    int width=-1, height=-1, version=-1;
-    string date;
-    int event_type=-1, event_size=-1;
+struct DatHeaderInfo
+{
+  int width = -1, height = -1, version = -1;
+  string date;
+  int event_type = -1, event_size = -1;
 };
 
 // Reads a DAT file and streams events paced to real time.
@@ -93,8 +109,9 @@ struct DatHeaderInfo {
 // Returns true on success; false otherwise.
 bool stream_dat_events(const string &path,
                        const function<void(const FrameEvent &, int delta)> &callback,
-                       DatHeaderInfo *out_header=nullptr,
-                       u32 window_us = 50'000);
+                       DatHeaderInfo *out_header,
+                       u32 window_us,
+                       const atomic<bool> &stop_flag);
 
 // Snapshot the current deque of active events (those within the sliding window)
 // maintained by the event reader. Thread-safe copy.
@@ -106,9 +123,9 @@ void snapshot_active_events(vector<FrameEvent> &out);
 // - cluster_eps, cluster_min_points: DBSCAN parameters
 // Returns a list of overlays (bounding boxes, colors, optional RPM per cluster).
 vector<FrameState::ClusterOverlay> cluster_worker(
-  vector<double> coords,
-  vector<RpmSample> rpm_samples,
-  double cluster_eps,
-  size_t cluster_min_points);
+    vector<double> coords,
+    vector<RpmSample> rpm_samples,
+    double cluster_eps,
+    size_t cluster_min_points);
 
-bool render_frame();
+void render_thread_loop();
