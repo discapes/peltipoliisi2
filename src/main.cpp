@@ -135,12 +135,10 @@ int main(int argc, char **argv)
 
   thread reader(run_dat_reader, dat_path);
   thread rpm_counter(rpm_counter_loop);
-  thread renderer(render_thread_loop);
+  render_thread_loop();
 
   if (reader.joinable())
     reader.join();
   if (rpm_counter.joinable())
     rpm_counter.join();
-  if (renderer.joinable())
-    renderer.join();
 }
