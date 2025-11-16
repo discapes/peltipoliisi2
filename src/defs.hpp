@@ -19,7 +19,6 @@ struct FrameState {
   mutex mtx;
   cv::Mat frame; // BGR display buffer
   cv::Mat counts; // CV_32SC1 per-pixel event counters
-  int threshold{10};
   // Events collected in the current frame (reset each render)
   vector<FrameEvent> frame_events;
   atomic<bool> running{true};
